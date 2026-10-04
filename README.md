@@ -1,94 +1,218 @@
 # Stream Sniffer
 
-A Chrome extension that catches the HLS (`.m3u8`) streams a page plays, plus the
-`Referer`/`Origin`/`User-Agent` headers it sent. You can then replay a stream in VLC, or in a
-player page bundled with the extension that sends those same headers.
+A Chrome extension that finds the video stream a web page is playing and lets you watch it on its
+own: in a clean player tab, in VLC, or on a Chromecast.
+
+Many sites play HLS video (`.m3u8` playlists) inside a cluttered embedded player. Stream Sniffer
+watches the requests a page makes, picks out the playlists, and records the headers the page sent
+with them (Referer, Origin, User-Agent). Stream servers usually check those headers, so you need
+them to play the stream anywhere else.
+
+> **Use it responsibly.** Stream Sniffer replays what your own browser is already receiving. Only
+> use it with streams you have the right to watch.
+
+## Features
+
+- **Stream capture.** Lists every `.m3u8` playlist a tab loads, including ones inside embedded
+  iframes from other sites.
+- **Built-in player.** Plays a captured stream in its own tab, with the original Referer and
+  Origin sent on every request.
+- **Copy commands.** One click copies a VLC command or a `curl` command with the captured headers.
+- **Chromecast relay (beta).** Sends the stream to a Chromecast as real video, not a mirrored tab.
+  See [Chromecast relay (beta)](#chromecast-relay-beta).
+
+## Requirements
+
+- **Google Chrome.** Other Chromium browsers may work but haven't been tested.
+- **For the relay:** [Node.js](https://nodejs.org/) 18 or later, and a Chromecast on the same
+  network as your computer.
+- **For the VLC command:** VLC installed. The copied command uses the macOS path
+  (`/Applications/VLC.app/...`); on other systems, swap in your own `vlc` path.
 
 ## Install
 
-1. Open `chrome://extensions` and turn on **Developer mode**.
-2. Click **Load unpacked** and pick the `extension/` folder.
-3. Pin the extension so its icon stays in the toolbar.
+1. Get the code:
+   ```
+   git clone https://github.com/afxjzs/stream-sniffer.git
+   ```
+2. Open `chrome://extensions` and turn on **Developer mode** (top right).
+3. Click **Load unpacked** and select the **`extension`** folder inside `stream-sniffer`.
+   Don't select the `stream-sniffer` folder itself, or Chrome reports "Manifest file is missing".
+4. Pin the extension: open the puzzle-piece menu in the toolbar and click the pin next to
+   Stream Sniffer.
+
+To update later, run `git pull`, then click the reload icon (↻) on the extension's card in
+`chrome://extensions`.
 
 ## Use
 
-1. Open the page and start the video.
-2. The icon badge counts the playlists seen on that tab. Click the icon.
-3. For each playlist the popup offers:
-   - **Open in player**: opens `player.html` in a new tab and plays the stream there, with the
-     captured Referer/Origin rewritten onto its requests.
-   - **Copy VLC command**: a ready-to-paste terminal command with `--http-referrer` and
-     `--http-user-agent` set.
-   - **Copy curl**: replays the browser's exact request, with every header. Handy for
-     figuring out which header a stubborn CDN wants.
-   - **Copy URL**.
-4. **Open player** (top right) opens the player empty. Paste in a URL and Referer by hand.
+1. Open the page with the video and press play.
+2. The Stream Sniffer icon shows a badge with the number of playlists it caught on that tab.
+   Click the icon.
+3. Each playlist in the popup has these buttons:
+   - **Open in player** plays the stream in a new tab, sending the captured Referer and Origin.
+   - **Copy VLC command** copies a terminal command that plays the stream in VLC.
+   - **Copy curl** copies a `curl` command that repeats the browser's request with every header.
+     It's useful for testing what a stream server accepts.
+   - **Copy URL** copies the playlist address.
+4. To play a URL you already have, click **Open player** at the top of the popup. Then paste the
+   stream URL, plus a Referer if the server needs one.
 
-The list resets when the tab loads a new page.
+The first playlist in the list is usually the master playlist. That's the one to pick. If a page
+loads an ad or a decoy first, try the others.
 
-## Casting to a Chromecast
+The list resets when the tab loads a new page. The extension only sees requests made after it was
+installed, so reload a page that was already open.
 
-The player page has two buttons:
+## Chromecast relay (beta)
 
-- **Cast via Chrome** asks Chrome to cast the video element. Chrome decides whether it can
-  send the video itself or falls back to mirroring the tab.
-- **Cast via relay** sends the stream straight to the TV. Some stream servers answer only
-  Chrome itself (curl and VLC get 403 even with identical headers), so the **player tab does
-  all the fetching**. A small relay on this Mac queues the URLs the TV asks for. The player tab
-  fetches each one through Chrome and hands it back, and the relay serves it to the TV on your
-  network. **Keep the player tab open while casting.** Playback on the laptop stops when the
-  TV takes over; press Play to watch there again. The relay serves one stream at a time.
-  Start it first and leave it running while you watch:
+The relay sends a stream to a Chromecast as real video, so the TV plays it at full quality and
+your computer doesn't re-encode a tab.
 
-  ```
-  node relay/server.mjs
-  ```
+It's experimental. It plays some streams smoothly. On others the TV keeps buffering, and the cause
+isn't known yet.
 
-  It needs Node 18 or later and has no dependencies. It listens on port 8788 and prints the
-  network address the TV will use. Set `RELAY_PORT` or `RELAY_HOST` to override them.
-  Clicking the button opens a cast page; click **Cast to TV** and pick the Chromecast. The page
-  shows how many requests the TV is making and any errors from the stream server.
+### Why it's needed
 
-  Only this Mac can register streams. Other devices on the network can fetch only the hosts
-  the registered stream's own playlists point to.
+A Chromecast fetches video itself, and it can't send the Referer or Origin a stream server
+expects. Some servers go further and reject anything that isn't the browser itself: in testing,
+`curl` and VLC got HTTP 403 even with identical headers.
+
+So the relay never fetches the stream itself. The player tab does it:
+
+1. The TV asks the relay (a small server on your computer) for a playlist or video segment.
+2. The relay puts the request in a queue.
+3. The Stream Sniffer player tab picks it up, fetches it through Chrome, and hands it back.
+4. The relay rewrites playlists so every link points back to itself, then sends the data to the TV.
+
+### Set up
+
+Start the relay in a terminal from the `stream-sniffer` folder and leave it running:
+
+```
+node relay/server.mjs
+```
+
+It has no dependencies to install. When it's ready, it prints the network address the TV will use
+and then `[relay] ready`.
+
+### Cast
+
+1. Open a stream in the player (**Open in player** in the popup).
+2. Click **Cast via relay (beta)**. The player checks the stream, then shows the cast controls
+   below the buttons.
+3. Click **Cast to TV** and choose your Chromecast.
+
+Playback on your computer stops when the TV takes over, so the stream isn't downloaded twice.
+Press **Play** to watch on the computer again.
+
+If the device picker doesn't open from inside the player, click **Open the cast page in its own
+tab** and cast from there.
+
+### Keep in mind
+
+- **Keep the player tab open.** It does the fetching for the TV. If you close it, the TV stops,
+  and the cast controls show a warning.
+- **One stream at a time.** Starting a new relay cast stops the previous one, and the old tab says
+  so.
+- **Your computer must stay awake** and on the same network as the Chromecast.
+- **Watch the "Relay activity" box** if the TV stalls. It shows how many requests the TV has made
+  and any errors from the stream server.
+
+### Security
+
+The relay listens on your local network so the TV can reach it. To limit what other devices can
+do with it:
+
+- Only your own computer can register streams, see their details, or open the cast page.
+- Other devices can only fetch hosts that the registered stream's own playlists point to.
+  Requests for any other host get HTTP 403.
+
+### Settings
+
+| Setting | Default | How to change it |
+| --- | --- | --- |
+| Relay port | `8788` | `RELAY_PORT=9000 node relay/server.mjs` |
+| Address the TV uses | First IPv4 address found (`en0` first) | `RELAY_HOST=192.168.1.20 node relay/server.mjs` |
+| Relay address the extension uses | `http://localhost:8788` | See below |
+
+If you change the port, tell the extension too. Open the player tab, open DevTools (⌥⌘I), and run
+this in the Console:
+
+```js
+chrome.storage.local.set({ relayUrl: 'http://localhost:9000' })
+```
+
+The player shows the relay address in its status messages, so you can confirm which one it uses.
+
+## Cast via Chrome
+
+The player also has a **Cast via Chrome** button. It asks Chrome to cast the video element using
+Chrome's built-in casting. In testing so far, Chrome hasn't cast the stream this way: it either
+declined ("The prompt was dismissed") or fell back to mirroring the tab. Use the relay instead.
+
+## Troubleshooting
+
+| Problem | What to do |
+| --- | --- |
+| "Manifest file is missing or unreadable" when loading | Select the `extension` folder, not `stream-sniffer`. |
+| The popup says no streams were seen | Reload the page and press play again. The extension only sees requests made after it was loaded. |
+| The player shows "HTTP 403" | The captured link has probably expired. Many servers use short-lived tokens. Reload the source page and capture it again. |
+| VLC or `curl` gets 403 but the player works | The server only accepts Chrome itself. Use the player or the relay. |
+| "Relay: not running at http://localhost:8788" | Start the relay with `node relay/server.mjs`. |
+| The relay exits with "is not reaching this relay" | Another program is using the port. Pick another with `RELAY_PORT` and update `relayUrl` (see [Settings](#settings)). |
+| The cast controls say Google Cast is unavailable | Use Google Chrome, and check that an ad or script blocker isn't blocking `gstatic.com`. |
+| The TV keeps buffering | Known beta issue for some streams. Check "Relay activity" for errors, or [open an issue](https://github.com/afxjzs/stream-sniffer/issues) with what it shows. |
 
 ## How it works
 
-- `background.js` listens to `webRequest.onSendHeaders` for `.m3u8` URLs in every frame,
-  including cross-origin embed iframes. It stores them per tab in `chrome.storage.session`.
-  Reading Referer and Origin requires the `extraHeaders` option.
-- A web page can't set `Referer` itself, so the player asks the background to install a
-  `declarativeNetRequest` session rule scoped to the player's tab. That rule sets
-  Referer/Origin on the stream requests. Extension pages with host permissions aren't subject
-  to CORS, so the CDN's CORS policy doesn't block the player.
-- Playback uses [hls.js](https://github.com/video-dev/hls.js) 1.7.3, vendored in
-  `extension/vendor/` because MV3 extensions can't load remote scripts.
-- Errors aren't swallowed. A failed load shows the hls.js error type, the HTTP status and the
-  URL on the player page.
+- **Capture.** `extension/background.js` listens to Chrome's `webRequest` events for `.m3u8` URLs
+  in every frame. It stores each URL per tab with all its request headers. Reading Referer and
+  Origin needs the `extraHeaders` option.
+- **Headers.** Web pages can't set Referer themselves. So the player asks the background to add a
+  `declarativeNetRequest` rule, scoped to the player's tab, that sets Referer and Origin on its
+  requests.
+- **Playback.** The player uses [hls.js](https://github.com/video-dev/hls.js) 1.7.3, bundled in
+  `extension/vendor/` because Manifest V3 extensions can't load remote code.
+- **Cast page.** The relay serves the cast page from `http://localhost`, because extension pages
+  can't load Google's Cast SDK. The player embeds it in a frame.
+- **Errors.** Failures appear on screen. The player shows the hls.js error and HTTP status. The
+  relay checks a stream through the player tab before casting, so a rejected stream shows an error
+  instead of a black TV.
 
-## Limits
+## Project layout
 
-- **Expiring URLs.** Many CDNs sign playlist URLs with short-lived tokens. If a copied
-  command or player tab stops working, reload the source page and capture it again.
-- **HLS only.** DASH (`.mpd`), WebRTC and WebSocket streams aren't captured.
-- **Disguised segments.** Some CDNs serve segments as `.png`/`.jpg`. hls.js usually copes, and
-  VLC sometimes doesn't.
-- **Decoys.** Some pages load an ad or fake playlist first. Every playlist is listed, so try
-  each one.
-- **The VLC command doesn't send `Origin`.** VLC has no flag for it. If a CDN checks Origin,
-  use the built-in player.
+```
+extension/        The Chrome extension (load this folder unpacked)
+  background.js   Captures playlists and headers; manages header rules
+  popup.*         Toolbar popup listing captured streams
+  player.*        Player tab, cast buttons, and the relay fetch loop
+  vendor/         hls.js and its license
+relay/
+  server.mjs      The Chromecast relay (Node, no dependencies)
+  cast.html       Cast controls page, served by the relay
+test/
+  e2e.mjs         End-to-end test
+  fixtures/       Fake stream site used by the test
+```
 
 ## Tests
 
-One end-to-end test loads the unpacked extension into Chrome for Testing. It runs against a
-fake site with three origins: a page, a cross-origin embed iframe running hls.js, and a CDN
-that returns 403 unless it gets the embed's Referer and a token. The test checks that:
+There's one end-to-end test. It loads the extension into Chrome for Testing and runs it against a
+fake site on your machine. The site mimics a real one with three parts: a page, an embedded player
+from another origin, and a stream server that returns 403 without the right Referer and token.
 
-- the popup lists the captured playlist
-- the VLC command's Referer is accepted by the CDN
-- **Open in player** plays the stream
-- manual mode plays the stream
-- manual mode without a Referer shows the 403 to the user
+It checks what a user would see:
+
+- The popup lists the captured playlist.
+- The VLC and `curl` commands carry headers the stream server accepts.
+- The player plays the stream.
+- The relay serves playlists and video to a client that sends no special headers, as a Chromecast
+  would.
+- The relay refuses hosts outside the stream.
+- Failures, such as a 403 or a relay that isn't running, show up on screen.
+
+To run it you need `ffmpeg` on your PATH. The first run uses it to generate a short test stream.
 
 ```
 cd test
@@ -97,5 +221,10 @@ npm test            # headless
 HEADFUL=1 npm test  # watch it run
 ```
 
-The first run generates a 20-second test stream with `ffmpeg`, which must be on PATH.
-Screenshots are written to `test/artifacts/`.
+The test starts its own relay on port 8789, so it doesn't conflict with one you're running on 8788.
+Screenshots are saved to `test/artifacts/`.
+
+## License
+
+[Apache License 2.0](LICENSE). Bundled hls.js is also Apache-2.0
+([its license](extension/vendor/LICENSE-hls.js)).

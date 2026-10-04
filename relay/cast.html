@@ -44,6 +44,7 @@
   </div>
   <div id="state" class="muted">Loading the Google Cast SDK…</div>
   <div id="error" class="error" hidden></div>
+  <div class="muted" style="font-size: 12px">Beta: the relay is experimental. Some streams play fine; others buffer on the TV.</div>
   <a class="standalone muted" id="standalone" target="_blank">Cast button not working here? Open the cast page in its own tab</a>
 
   <div class="panel">
@@ -121,7 +122,7 @@
   // support, e.g. Chromium builds), say so instead of showing "Loading Cast…" forever.
   const sdkTimeout = setTimeout(() => {
     setState('Google Cast never became available.', 'error');
-    showError('The Cast SDK did not report in within 10s. This page needs Google Chrome (not Chromium or another browser) with casting enabled.');
+    showError('The Cast SDK did not report in within 10s. Use Google Chrome, and check that no extension is blocking gstatic.com.');
     $('cast').textContent = 'Cast unavailable';
   }, 10000);
 
