@@ -1,0 +1,43 @@
+:root {
+  color-scheme: dark;
+  --bg: #15171c;
+  --panel: #1e2128;
+  --border: #2d313a;
+  --text: #e6e8eb;
+  --muted: #8b919c;
+  --accent: #4f8cff;
+  --error: #ff6b6b;
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+}
+body { margin: 0; background: var(--bg); color: var(--text); }
+h1 { font-size: 14px; margin: 0; }
+code { font: 11px/1.4 ui-monospace, Menlo, monospace; word-break: break-all; }
+.muted { color: var(--muted); }
+.small { font-size: 11px; }
+.error { color: var(--error); white-space: pre-wrap; }
+button {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit;
+}
+button:hover { border-color: var(--accent); }
+button.link { background: none; border: none; color: var(--accent); padding: 0; }
+
+/* popup */
+body.popup { width: 480px; padding: 12px; }
+.popup header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.popup ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.popup li { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px; display: grid; gap: 6px; }
+.popup .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.popup .cmd { color: var(--muted); max-height: 4.2em; overflow: auto; }
+
+/* player */
+body.player { padding: 16px; max-width: 1200px; margin: 0 auto; }
+.player form { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 8px; align-items: end; margin-bottom: 8px; }
+.player label { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }
+.player input { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; }
+.player .bar { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.player .bar p { margin: 0; }
+.player .actions { display: flex; gap: 6px; flex-shrink: 0; }
+.player #cast-status { margin: 4px 0 0; min-height: 1.4em; }
+.player video { width: 100%; background: #000; border-radius: 8px; margin-top: 8px; }
+@media (max-width: 700px) { .player form { grid-template-columns: 1fr; } }

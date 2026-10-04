@@ -1,0 +1,194 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stream Sniffer Cast</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #15171c; --panel: #1e2128; --border: #2d313a; --text: #e6e8eb;
+      --muted: #8b919c; --accent: #4f8cff; --error: #ff6b6b; --ok: #5fd38d;
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    main { max-width: 720px; margin: 0 auto; padding: 32px 16px; display: grid; gap: 16px; }
+    h1 { font-size: 18px; margin: 0; }
+    code { font: 12px/1.4 ui-monospace, Menlo, monospace; word-break: break-all; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: grid; gap: 6px; }
+    .muted { color: var(--muted); }
+    .error { color: var(--error); white-space: pre-wrap; }
+    .ok { color: var(--ok); }
+    button {
+      font: inherit; font-size: 16px; padding: 12px 20px; border-radius: 8px; cursor: pointer;
+      background: var(--accent); color: #fff; border: none; justify-self: start;
+    }
+    button:disabled { opacity: 0.5; cursor: default; }
+    button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); font-size: 13px; padding: 6px 12px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Cast to TV</h1>
+  <div class="row">
+    <button id="cast" disabled>Loading Cast…</button>
+    <button id="stop" class="secondary" hidden>Stop casting</button>
+  </div>
+  <div id="state" class="muted">Loading the Google Cast SDK…</div>
+  <div id="error" class="error" hidden></div>
+
+  <div class="panel">
+    <div class="muted">Chromecast will load</div>
+    <code id="media-url">…</code>
+    <div class="muted" id="stream-info"></div>
+  </div>
+
+  <div class="panel">
+    <div class="muted">Relay activity (requests for this stream)</div>
+    <div id="activity">No requests yet.</div>
+    <div id="relay-errors" class="error"></div>
+  </div>
+</main>
+
+<script>
+  const id = location.pathname.split('/').filter(Boolean)[1];
+  const $ = (s) => document.getElementById(s);
+  let stream = null;
+
+  function showError(msg) {
+    console.error('[cast]', msg);
+    $('error').textContent = msg;
+    $('error').hidden = false;
+  }
+  const setState = (msg, cls = 'muted') => { $('state').textContent = msg; $('state').className = cls; };
+
+  async function loadStream() {
+    const r = await fetch(`/api/streams/${id}`);
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+    return body;
+  }
+
+  // Poll the relay so it's visible whether the TV is fetching, and what the CDN says.
+  async function poll() {
+    try {
+      const s = await loadStream();
+      const st = s.stats;
+      $('activity').textContent = st.requests
+        ? `${st.requests} requests · last at ${new Date(st.lastRequestAt).toLocaleTimeString()}`
+        : 'No requests yet.';
+      // The player tab long-polls at least every ~25s; much longer means it's closed or stuck.
+      const seen = s.bridgeSeenSecondsAgo;
+      const bridgeWarning = seen === null || seen > 40
+        ? 'The Stream Sniffer player tab is not checking in. It does the fetching for the TV, so keep it open (reopen it and click "Cast via relay" if you closed it).'
+        : '';
+      $('relay-errors').textContent = [bridgeWarning, ...st.errors.map((e) => `${new Date(e.at).toLocaleTimeString()}  ${e.error}`)]
+        .filter(Boolean)
+        .join('\n');
+    } catch (err) {
+      $('relay-errors').textContent = `Can't reach the relay: ${err.message}`;
+    }
+  }
+
+  loadStream()
+    .then((s) => {
+      stream = s;
+      $('media-url').textContent = s.mediaUrl;
+      $('stream-info').textContent = `${s.info.live ? 'Live' : 'On-demand'} · ${s.info.segmentFormat === 'fmp4' ? 'fMP4' : 'MPEG-TS'} segments · source ${s.url}`;
+      setInterval(poll, 2000);
+      poll();
+    })
+    .catch((err) => showError(`Couldn't load stream details: ${err.message}`));
+
+  // The SDK calls __onGCastApiAvailable exactly once. If it never does (browser without Cast
+  // support, e.g. Chromium builds), say so instead of showing "Loading Cast…" forever.
+  const sdkTimeout = setTimeout(() => {
+    setState('Google Cast never became available.', 'error');
+    showError('The Cast SDK did not report in within 10s. This page needs Google Chrome (not Chromium or another browser) with casting enabled.');
+    $('cast').textContent = 'Cast unavailable';
+  }, 10000);
+
+  window.__onGCastApiAvailable = (isAvailable, errorInfo) => {
+    clearTimeout(sdkTimeout);
+    if (!isAvailable) {
+      setState('Google Cast is not available in this browser.', 'error');
+      showError(`Cast SDK unavailable${errorInfo ? `: ${JSON.stringify(errorInfo)}` : ''}. Use Chrome, and make sure it's not blocked by an extension.`);
+      $('cast').textContent = 'Cast unavailable';
+      return;
+    }
+    initCast();
+  };
+
+  function initCast() {
+    const context = cast.framework.CastContext.getInstance();
+    context.setOptions({
+      receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
+      autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED,
+    });
+    const player = new cast.framework.RemotePlayer();
+    const controller = new cast.framework.RemotePlayerController(player);
+
+    const btn = $('cast');
+    btn.disabled = false;
+    btn.textContent = 'Cast to TV';
+    setState('Ready. Click "Cast to TV" and pick your Chromecast.');
+
+    controller.addEventListener(cast.framework.RemotePlayerEventType.IS_CONNECTED_CHANGED, () => {
+      $('stop').hidden = !player.isConnected;
+      if (!player.isConnected) setState('Not casting.');
+    });
+    controller.addEventListener(cast.framework.RemotePlayerEventType.PLAYER_STATE_CHANGED, () => {
+      const state = player.playerState;
+      const media = context.getCurrentSession()?.getMediaSession();
+      if (state === 'IDLE' && media?.idleReason === 'ERROR') {
+        setState('The TV stopped with an error.', 'error');
+        showError('The Chromecast reported a playback error. Check "Relay activity" below: if there are no requests, the TV could not reach the relay; if there are CDN errors, the stream rejected the relay.');
+      } else if (state) {
+        setState(`TV: ${state.toLowerCase()}`, state === 'PLAYING' ? 'ok' : 'muted');
+      }
+    });
+
+    btn.addEventListener('click', async () => {
+      $('error').hidden = true;
+      if (!stream) return showError('Stream details have not loaded yet.');
+      try {
+        if (!context.getCurrentSession()) {
+          setState('Choose a device…');
+          await context.requestSession();
+        }
+        const session = context.getCurrentSession();
+        if (!session) throw new Error('no Cast session after the device picker closed');
+        setState(`Loading on ${session.getCastDevice().friendlyName}…`);
+
+        const info = new chrome.cast.media.MediaInfo(stream.mediaUrl, 'application/x-mpegurl');
+        info.streamType = stream.info.live ? chrome.cast.media.StreamType.LIVE : chrome.cast.media.StreamType.BUFFERED;
+        if (stream.info.segmentFormat === 'fmp4') {
+          info.hlsSegmentFormat = chrome.cast.media.HlsSegmentFormat.FMP4;
+          info.hlsVideoSegmentFormat = chrome.cast.media.HlsVideoSegmentFormat.FMP4;
+        } else {
+          info.hlsSegmentFormat = chrome.cast.media.HlsSegmentFormat.TS;
+          info.hlsVideoSegmentFormat = chrome.cast.media.HlsVideoSegmentFormat.MPEG2_TS;
+        }
+        info.metadata = new chrome.cast.media.GenericMediaMetadata();
+        info.metadata.title = 'Stream Sniffer';
+
+        await session.loadMedia(new chrome.cast.media.LoadRequest(info));
+        setState(`Sent to ${session.getCastDevice().friendlyName}.`, 'ok');
+      } catch (err) {
+        // The SDK rejects with an error code string such as "cancel" or "session_error".
+        if (err === 'cancel' || err?.code === 'cancel') setState('Device picker closed.');
+        else {
+          setState('Casting failed.', 'error');
+          showError(`Cast error: ${typeof err === 'string' ? err : err?.message || JSON.stringify(err)}`);
+        }
+      }
+    });
+
+    $('stop').addEventListener('click', () => context.endCurrentSession(true));
+  }
+</script>
+<script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"
+        onerror="showError('Could not load the Google Cast SDK from gstatic.com (offline or blocked).'); document.getElementById('cast').textContent = 'Cast unavailable'"></script>
+</body>
+</html>

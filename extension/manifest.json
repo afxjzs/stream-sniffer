@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Stream Sniffer",
+  "version": "0.1.0",
+  "description": "Captures HLS (.m3u8) streams a page plays, with the headers needed to replay them in VLC or a built-in player.",
+  "permissions": ["webRequest", "storage", "declarativeNetRequestWithHostAccess"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Stream Sniffer",
+    "default_popup": "popup.html"
+  }
+}

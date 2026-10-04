@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Stream Sniffer Player</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="player">
+  <form id="form">
+    <label>Stream URL <input name="url" type="url" required placeholder="https://…/index.m3u8"></label>
+    <label>Referer <input name="referer" type="url" placeholder="https://embed-site/ (optional)"></label>
+    <label>Origin <input name="origin" type="url" placeholder="https://embed-site (optional)"></label>
+    <button type="submit">Play</button>
+  </form>
+  <div id="error" class="error" hidden></div>
+  <div class="bar">
+    <p id="status" class="muted"></p>
+    <span class="actions">
+      <button id="cast" type="button">Cast via Chrome</button>
+      <button id="relay" type="button">Cast via relay</button>
+    </span>
+  </div>
+  <p id="cast-status" class="muted small"></p>
+  <video id="video" controls playsinline></video>
+  <script src="vendor/hls.min.js"></script>
+  <script src="player.js"></script>
+</body>
+</html>

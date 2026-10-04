@@ -1,0 +1,11 @@
+{
+  "name": "stream-sniffer-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node e2e.mjs"
+  },
+  "devDependencies": {
+    "puppeteer": "25.12.0"
+  }
+}
