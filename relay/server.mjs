@@ -19,7 +19,8 @@ import { fileURLToPath } from 'node:url';
 const PORT = Number(process.env.RELAY_PORT || 8788);
 const LAN_HOST = process.env.RELAY_HOST || lanAddress();
 const LAN_BASE = `http://${LAN_HOST}:${PORT}`;
-const CAST_HTML = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'cast.html'), 'utf8');
+// Read on every request, so edits to the cast page apply without restarting the relay.
+const CAST_HTML_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cast.html');
 
 // How long the TV's request waits for the player tab to deliver, and how long one long-poll
 // from the player tab is held open when there is nothing to fetch.
@@ -294,7 +295,7 @@ async function handle(req, res) {
 
   if (parts[0] === 'cast') {
     if (!stream?.info) return send(res, 404, 'unknown stream (the relay may have restarted)');
-    return send(res, 200, CAST_HTML, { 'content-type': 'text/html; charset=utf-8' });
+    return send(res, 200, fs.readFileSync(CAST_HTML_PATH, 'utf8'), { 'content-type': 'text/html; charset=utf-8' });
   }
 
   if (parts[0] === 's' && parts[2] === 'r' && parts[3]) {
