@@ -260,7 +260,7 @@ async function handle(req, res) {
       url: body.url,
       hosts: new Set([new URL(body.url).host]),
       info: null,
-      stats: { requests: 0, lastRequestAt: null, errors: [] },
+      stats: { requests: 0, lastRequestAt: null, errors: [], recent: [] },
       queue: [],
       waiters: [],
       pending: new Map(),
@@ -268,6 +268,10 @@ async function handle(req, res) {
     });
     console.log(`[relay] ${id}: registered ${body.url}; waiting for the player tab to probe it`);
     return sendJson(res, 200, { id });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/streams') {
+    return sendJson(res, 200, [...streams].map(([id, s]) => ({ id, url: s.url, superseded: s.superseded, requests: s.stats.requests })));
   }
 
   // /api/streams/<id>[/<action>[/<jobId>]]
@@ -313,7 +317,19 @@ async function handle(req, res) {
     if (!stream.hosts.has(new URL(upstream).host)) return send(res, 403, 'host not part of this stream');
     stream.stats.requests++;
     stream.stats.lastRequestAt = new Date().toISOString();
+    const started = Date.now();
     const r = await fetchUpstream(parts[1], stream, upstream);
+    // Per-request timing: shows whether the TV is starved (slow fetches) or fed junk.
+    stream.stats.recent.push({
+      at: new Date().toISOString(),
+      file: new URL(upstream).pathname.split('/').pop(),
+      status: r.error ? r.status : 200,
+      bytes: r.body?.length ?? 0,
+      ms: Date.now() - started,
+      type: r.type,
+      head: r.body && !r.isPlaylist ? r.body.subarray(0, 8).toString('hex') : undefined,
+    });
+    stream.stats.recent.splice(0, stream.stats.recent.length - 30);
     if (r.error) return send(res, r.status, r.error, { 'content-type': 'text/plain' });
     return send(res, 200, r.body, { 'content-type': r.type });
   }
