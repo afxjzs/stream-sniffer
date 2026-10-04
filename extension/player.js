@@ -113,7 +113,16 @@ if (!video.remote) {
 // fetching: it long-polls the relay for URLs the TV wants, fetches them here (where the
 // Referer/Origin rewrite applies), and posts the bytes back. The relay serves them to the TV.
 // That's why this tab has to stay open while casting.
-const RELAY = 'http://localhost:8788';
+// Where the relay listens. Override with chrome.storage.local.relayUrl (the E2E test uses this
+// to run its own relay next to yours); the active address shows in every relay message.
+const DEFAULT_RELAY = 'http://localhost:8788';
+let RELAY = DEFAULT_RELAY;
+const relayReady = chrome.storage.local.get('relayUrl').then(({ relayUrl }) => {
+  if (relayUrl) {
+    RELAY = relayUrl;
+    console.log(`[stream-sniffer] using relay at ${RELAY} (from storage, not the default)`);
+  }
+});
 const relayBtn = document.getElementById('relay');
 const setRelay = (msg) => (castStatus.textContent = `Relay: ${msg}`);
 let bridge = null;
@@ -184,7 +193,8 @@ relayBtn.addEventListener('click', async () => {
     setRelay('enter a stream URL first.');
     return;
   }
-  setRelay('registering stream with the relay…');
+  await relayReady;
+  setRelay(`registering stream with the relay at ${RELAY}…`);
   // Make sure this tab's header rewrite matches the form, since this tab does the fetching.
   const prep = await chrome.runtime.sendMessage({ type: 'prepare-player', referer: s.referer, origin: s.origin });
   if (!prep?.ok) {
@@ -229,13 +239,10 @@ relayBtn.addEventListener('click', async () => {
     video.load();
     setStatus('Stopped here while casting. Press Play to watch on this computer again.');
   }
-  setRelay(`ready — keep this tab open, it fetches the stream for the TV. Opening the cast page…`);
-  try {
-    await chrome.tabs.create({ url: info.castPageUrl });
-  } catch (err) {
-    console.error('[stream-sniffer] could not open cast page', err);
-    setRelay(`stream ready, but the cast page didn't open (${err.message}). Open it yourself: ${info.castPageUrl}`);
-  }
+  const frame = document.getElementById('cast-frame');
+  frame.src = `${info.castPageUrl}?embed=1`;
+  frame.hidden = false;
+  setRelay('ready — click "Cast to TV" below. Keep this tab open; it fetches the stream for the TV.');
 });
 
 function readForm() {

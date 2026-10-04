@@ -16,7 +16,9 @@ const extDir = path.resolve(here, '../extension');
 const streamDir = path.join(here, 'fixtures/stream');
 const artifactsDir = path.join(here, 'artifacts');
 const relayPath = path.resolve(here, '../relay/server.mjs');
-const RELAY = 'http://localhost:8788';
+// Not 8788, so the test can run while your own relay is up.
+const RELAY_PORT = 8789;
+const RELAY = `http://localhost:${RELAY_PORT}`;
 const HEADLESS = process.env.HEADFUL ? false : true;
 
 function step(msg) {
@@ -94,7 +96,10 @@ async function waitForText(page, re, timeoutMs = 10000) {
 // line, which it prints only after checking that localhost and the LAN address reach it.
 function startRelay() {
   return new Promise((resolve, reject) => {
-    const proc = spawn('node', [relayPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const proc = spawn('node', [relayPath], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, RELAY_PORT: String(RELAY_PORT) },
+    });
     const timer = setTimeout(() => {
       proc.kill();
       reject(new Error('relay did not print "ready" within 10s'));
@@ -136,7 +141,7 @@ async function main() {
     // A relay you started by hand would answer instead of the one this test starts.
     const strayRelay = await fetch(`${RELAY}/health`).then((r) => r.text(), () => null);
     if (strayRelay !== null) {
-      throw new Error(`something is already running on ${RELAY} (${strayRelay.slice(0, 60)}). Stop your relay before running the test.`);
+      throw new Error(`something is already running on ${RELAY} (${strayRelay.slice(0, 60)}). Is a previous test run still alive?`);
     }
 
     step('Launch Chrome for Testing with the extension');
@@ -150,6 +155,8 @@ async function main() {
     const extensions = await browser.extensions();
     const ext = [...extensions.values()].find((e) => e.path === extDir);
     assert(ext, `extension loaded (id ${ext?.id})`);
+    const [sw] = await ext.workers();
+    await sw.evaluate((url) => chrome.storage.local.set({ relayUrl: url }), RELAY);
 
     step('Visit the fake site and let its embedded player start');
     const page = await browser.newPage();
@@ -236,16 +243,17 @@ async function main() {
     const noRelayMsg = await waitForText(player, /^Relay:.*relay\/server\.mjs/);
     ok(`player reports: "${noRelayMsg}"`);
 
-    step('Start the relay; "Cast via relay" opens its cast page with a LAN address for the TV');
+    step('Start the relay; "Cast via relay" shows the cast controls inside the player, with a LAN address for the TV');
     relay = await startRelay();
-    const castTargetP = browser.waitForTarget((t) => t.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
     await player.click('button::-p-text(Cast via relay)');
-    const castPage = await (await castTargetP).asPage();
-    const mediaText = await waitForText(castPage, /http:\/\/[\d.]+:8788\/\S+/);
-    const mediaUrl = mediaText.match(/http:\/\/[\d.]+:8788\/\S+/)[0];
-    ok(`cast page shows the URL the Chromecast will load: ${mediaUrl}`);
+    const castFrame = await player.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
+    const mediaText = await waitForText(castFrame, /http:\/\/[\d.]+:8789\/\S+/);
+    const mediaUrl = mediaText.match(/http:\/\/[\d.]+:8789\/\S+/)[0];
+    ok(`cast controls show the URL the Chromecast will load: ${mediaUrl}`);
     assert(!/^http:\/\/127\./.test(mediaUrl), 'that URL is a LAN address, not loopback (the TV must reach it)');
-    await castPage.screenshot({ path: path.join(artifactsDir, 'cast-page.png') });
+    const castTabs = (await browser.pages()).filter((p) => p.url().startsWith(`${RELAY}/cast/`));
+    assert(castTabs.length === 0, 'no separate cast tab was opened');
+    await player.screenshot({ path: path.join(artifactsDir, 'player-with-cast.png') });
 
     step('Acting as the Chromecast: plain GETs (no Referer, no cookies) get real video via the relay');
     servers.rejected.length = 0;

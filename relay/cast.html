@@ -26,6 +26,13 @@
     button:disabled { opacity: 0.5; cursor: default; }
     button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); font-size: 13px; padding: 6px 12px; }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    a { color: var(--accent); }
+    /* Embedded in the extension's player page: compact, no title. */
+    body.embed main { padding: 12px; gap: 10px; max-width: none; }
+    body.embed h1 { display: none; }
+    body.embed .panel { padding: 10px; }
+    .standalone { display: none; font-size: 12px; }
+    body.embed .standalone { display: block; }
   </style>
 </head>
 <body>
@@ -37,6 +44,7 @@
   </div>
   <div id="state" class="muted">Loading the Google Cast SDK…</div>
   <div id="error" class="error" hidden></div>
+  <a class="standalone muted" id="standalone" target="_blank">Cast button not working here? Open the cast page in its own tab</a>
 
   <div class="panel">
     <div class="muted">Chromecast will load</div>
@@ -53,6 +61,10 @@
 
 <script>
   const id = location.pathname.split('/').filter(Boolean)[1];
+  if (new URLSearchParams(location.search).has('embed')) {
+    document.body.classList.add('embed');
+    document.getElementById('standalone').href = location.pathname;
+  }
   const $ = (s) => document.getElementById(s);
   let stream = null;
 

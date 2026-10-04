@@ -21,6 +21,9 @@
     </span>
   </div>
   <p id="cast-status" class="muted small"></p>
+  <!-- The relay's cast page. It can load Google's Cast SDK, which extension pages can't.
+       allow="presentation" lets it open Chrome's device picker from inside this frame. -->
+  <iframe id="cast-frame" hidden allow="presentation" title="Cast controls"></iframe>
   <video id="video" controls playsinline></video>
   <script src="vendor/hls.min.js"></script>
   <script src="player.js"></script>
