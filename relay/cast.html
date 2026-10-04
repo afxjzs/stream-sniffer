@@ -64,6 +64,10 @@
   if (new URLSearchParams(location.search).has('embed')) {
     document.body.classList.add('embed');
     document.getElementById('standalone').href = location.pathname;
+    // Tell the player page how tall we are, so it can size the frame with no inner scrollbar.
+    const report = () => parent.postMessage({ type: 'cast-frame-height', height: document.documentElement.scrollHeight }, '*');
+    new ResizeObserver(report).observe(document.body);
+    report();
   }
   const $ = (s) => document.getElementById(s);
   let stream = null;

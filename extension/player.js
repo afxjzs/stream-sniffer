@@ -17,6 +17,7 @@ function setStatus(msg) {
 
 async function play({ url, referer, origin }) {
   errorEl.hidden = true;
+  video.hidden = false;
   if (hls) {
     hls.destroy();
     hls = null;
@@ -237,12 +238,20 @@ relayBtn.addEventListener('click', async () => {
     hls = null;
     video.removeAttribute('src');
     video.load();
+    video.hidden = true; // an empty player box while the TV plays is just dead space
     setStatus('Stopped here while casting. Press Play to watch on this computer again.');
   }
   const frame = document.getElementById('cast-frame');
   frame.src = `${info.castPageUrl}?embed=1`;
   frame.hidden = false;
+  frame.style.height = '300px'; // until the cast page reports its real height
   setRelay('ready — click "Cast to TV" below. Keep this tab open; it fetches the stream for the TV.');
+});
+
+// The cast page reports its content height; grow the frame to match so it never scrolls.
+window.addEventListener('message', (e) => {
+  if (e.origin !== new URL(RELAY).origin || e.data?.type !== 'cast-frame-height') return;
+  document.getElementById('cast-frame').style.height = `${Math.ceil(e.data.height)}px`;
 });
 
 function readForm() {
