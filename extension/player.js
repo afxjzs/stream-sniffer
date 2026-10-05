@@ -81,7 +81,11 @@ async function play({ url, referer, origin }) {
       showError(`Playback failed: ${detail}`);
       setStatus('');
     } else {
+      // hls.js retries these itself, but a stall with no explanation looks like a frozen
+      // picture; show the latest one until playback is healthy again.
       console.warn('[stream-sniffer] non-fatal hls.js error:', detail);
+      lastProblem = `${new Date().toLocaleTimeString()}: ${detail} (retrying)`;
+      showHealth();
     }
   });
   hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
@@ -91,6 +95,26 @@ async function play({ url, referer, origin }) {
   hls.loadSource(url);
   hls.attachMedia(video);
 }
+
+// Buffering and recent stream problems, shown under the status line so a stall is never silent.
+const healthEl = document.getElementById('health');
+let bufferingSince = null;
+let lastProblem = '';
+function showHealth() {
+  const parts = [];
+  if (bufferingSince) parts.push(`Buffering since ${bufferingSince}, waiting for video data`);
+  if (lastProblem) parts.push(`Last problem ${lastProblem}`);
+  healthEl.textContent = parts.join(' · ');
+}
+video.addEventListener('waiting', () => {
+  bufferingSince ??= new Date().toLocaleTimeString();
+  showHealth();
+});
+video.addEventListener('playing', () => {
+  bufferingSince = null;
+  lastProblem = '';
+  showHealth();
+});
 
 // Autoplay with sound needs a user gesture on this tab; fall back to muted and say so.
 async function startPlayback() {
