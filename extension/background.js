@@ -4,6 +4,21 @@
 
 const M3U8 = /\.m3u8(\?|#|$)/i;
 const key = (tabId) => `tab:${tabId}`;
+// Origins of every frame loaded in a tab, to credit service-worker requests to the right tab.
+const framesKey = (tabId) => `frames:${tabId}`;
+
+// Players often add a cache-buster (?_=1791240957421) on every refresh. Ignore such params when
+// deciding whether two URLs are the same stream: params named like cache-busters, or whose
+// value is a bare 10-13 digit timestamp.
+const CACHE_BUSTER_NAMES = new Set(['_', 'cb', 'nocache', 'rnd', 'rand', 'ts', 'timestamp']);
+function streamKey(url) {
+  const u = new URL(url);
+  for (const [name, value] of [...u.searchParams]) {
+    if (CACHE_BUSTER_NAMES.has(name.toLowerCase()) || /^\d{10,13}$/.test(value)) u.searchParams.delete(name);
+  }
+  u.hash = '';
+  return u.href;
+}
 
 // Storage writes are read-modify-write; chain them so concurrent requests don't drop entries.
 let queue = Promise.resolve();
@@ -15,48 +30,87 @@ function enqueue(fn) {
 async function addCapture(tabId, capture) {
   const k = key(tabId);
   const { [k]: list = [] } = await chrome.storage.session.get(k);
-  if (list.some((c) => c.url === capture.url)) return;
+  const i = list.findIndex((c) => streamKey(c.url) === streamKey(capture.url));
+  if (i >= 0) {
+    // A live player re-requests its playlist every few seconds; nothing to save unless the URL
+    // changed (a fresh cache-buster). Then keep the newest URL and headers in the same slot.
+    if (list[i].url === capture.url) return;
+    list[i] = { ...capture, time: list[i].time };
+    await chrome.storage.session.set({ [k]: list });
+    return;
+  }
   list.push(capture);
   await chrome.storage.session.set({ [k]: list });
   await chrome.action.setBadgeText({ tabId, text: String(list.length) });
 }
 
-async function clearTab(tabId) {
+async function clearTab(tabId, topOrigin) {
   await chrome.storage.session.remove(key(tabId));
+  await chrome.storage.session.set({ [framesKey(tabId)]: [topOrigin] });
   await chrome.action.setBadgeText({ tabId, text: '' });
+}
+
+async function addFrameOrigin(tabId, origin) {
+  const k = framesKey(tabId);
+  const { [k]: origins = [] } = await chrome.storage.session.get(k);
+  if (origins.includes(origin)) return;
+  origins.push(origin);
+  await chrome.storage.session.set({ [k]: origins });
+}
+
+// Requests from a service worker have no tab (tabId -1). Credit them to every tab that has a
+// frame from the worker's origin; with none, say so instead of dropping it silently.
+async function tabsForOrigin(origin) {
+  const all = await chrome.storage.session.get(null);
+  return Object.entries(all)
+    .filter(([k, origins]) => k.startsWith('frames:') && origins.includes(origin))
+    .map(([k]) => Number(k.slice('frames:'.length)));
 }
 
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
-    if (details.tabId < 0 || !M3U8.test(details.url)) return;
+    if (!M3U8.test(details.url)) return;
     // Our own player's requests also hit .m3u8 URLs; don't record those.
     if (details.initiator?.startsWith('chrome-extension://')) return;
     const h = Object.fromEntries((details.requestHeaders || []).map((x) => [x.name.toLowerCase(), x.value]));
-    enqueue(() =>
-      addCapture(details.tabId, {
-        url: details.url,
-        referer: h.referer || '',
-        origin: h.origin || '',
-        userAgent: h['user-agent'] || '',
-        headers: h, // everything the browser sent, for the curl command and the relay
-        time: Date.now(),
-      })
-    );
+    const capture = {
+      url: details.url,
+      referer: h.referer || '',
+      origin: h.origin || '',
+      userAgent: h['user-agent'] || '',
+      headers: h, // everything the browser sent, for the curl command and the relay
+      time: Date.now(),
+    };
+    if (details.tabId >= 0) {
+      enqueue(() => addCapture(details.tabId, capture));
+      return;
+    }
+    enqueue(async () => {
+      const tabs = details.initiator ? await tabsForOrigin(details.initiator) : [];
+      if (!tabs.length) {
+        console.warn('[stream-sniffer] playlist fetched outside any tab, with no matching frame; not listed:', details.url, 'initiator:', details.initiator);
+        return;
+      }
+      for (const tabId of tabs) await addCapture(tabId, { ...capture, viaServiceWorker: true });
+    });
   },
   { urls: ['<all_urls>'] },
   ['requestHeaders', 'extraHeaders'] // extraHeaders is required to see Referer and Origin
 );
 
-// A new top-level page load in the tab starts a fresh list.
+// A new top-level page load in the tab starts a fresh list; every frame load records its origin.
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    if (details.tabId >= 0) enqueue(() => clearTab(details.tabId));
+    if (details.tabId < 0) return;
+    const origin = new URL(details.url).origin;
+    if (details.type === 'main_frame') enqueue(() => clearTab(details.tabId, origin));
+    else enqueue(() => addFrameOrigin(details.tabId, origin));
   },
-  { urls: ['<all_urls>'], types: ['main_frame'] }
+  { urls: ['<all_urls>'], types: ['main_frame', 'sub_frame'] }
 );
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  enqueue(() => chrome.storage.session.remove(key(tabId)));
+  enqueue(() => chrome.storage.session.remove([key(tabId), framesKey(tabId)]));
   chrome.declarativeNetRequest
     .updateSessionRules({ removeRuleIds: [tabId] })
     .catch((err) => console.error('[stream-sniffer] failed to remove header rule for closed tab', tabId, err));

@@ -276,6 +276,39 @@ async function main() {
     const foreignRes = await fetch(foreign);
     assert(foreignRes.status === 403, `URL for an unrelated host -> 403 (got ${foreignRes.status})`);
 
+    step('Tricky site (service worker + PNG-disguised segments): captured, plays, and casts');
+    const tricky = await browser.newPage();
+    await tricky.goto(SITE + '/tricky');
+    await tricky.waitForFrame((f) => f.url().startsWith(EMBED));
+    await tricky.bringToFront();
+    const popup2P = browser.waitForTarget((t) => t.url().includes('/popup.html') && t !== popupTarget, { timeout: 5000 });
+    await ext.triggerAction(tricky);
+    const popup2 = await (await popup2P).asPage();
+    await popup2.waitForSelector('::-p-text(png/master.m3u8)', { timeout: 5000 });
+    ok('popup lists the playlist the service worker fetched');
+    let trickyItem = null;
+    for (const li of await popup2.$$('li')) {
+      if ((await li.evaluate((el) => el.textContent)).includes('png/master.m3u8')) trickyItem = li;
+    }
+    const trickyPlayerP = browser.waitForTarget((t) => t.url().includes('/player.html') && t.url() !== player.url(), { timeout: 5000 });
+    await (await trickyItem.$('button::-p-text(Open in player)')).click();
+    const trickyPlayer = await (await trickyPlayerP).asPage();
+    await trickyPlayer.bringToFront();
+    await waitForPlayback(trickyPlayer, 'extension player on PNG-disguised stream');
+    ok('extension player plays the PNG-disguised stream');
+    await trickyPlayer.click('button::-p-text(Cast via relay)');
+    const trickyFrame = await trickyPlayer.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
+    const trickyMedia = (await waitForText(trickyFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
+    const tMaster = await (await fetch(trickyMedia)).text();
+    const tVariantUrl = new URL(firstUri(tMaster), trickyMedia).href;
+    const tSegUrl = new URL(firstUri(await (await fetch(tVariantUrl)).text()), tVariantUrl).href;
+    const tSeg = await fetch(tSegUrl);
+    const tBytes = new Uint8Array(await tSeg.arrayBuffer());
+    assert(
+      tSeg.status === 200 && tBytes[0] === 0x47 && tSeg.headers.get('content-type') === 'video/mp2t',
+      `relay hands the TV plain MPEG-TS, not the PNG wrapper (${tSeg.status}, first byte 0x${tBytes[0]?.toString(16)}, ${tSeg.headers.get('content-type')})`
+    );
+
     step('Manual mode: paste URL + Referer into the player page');
     const manual = await browser.newPage();
     await manual.goto(`chrome-extension://${ext.id}/player.html`);

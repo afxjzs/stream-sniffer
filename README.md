@@ -169,6 +169,13 @@ declined ("The prompt was dismissed") or fell back to mirroring the tab. Use the
 - **Capture.** `extension/background.js` listens to Chrome's `webRequest` events for `.m3u8` URLs
   in every frame. It stores each URL per tab with all its request headers. Reading Referer and
   Origin needs the `extraHeaders` option.
+- **Service workers.** Some sites fetch the stream from a service worker, and Chrome reports
+  those requests without a tab. The extension credits them to the tab with a frame from the
+  worker's site. Players that add a cache-buster to each refresh (`?_=1791240957421`) show up
+  as one stream, not a new one every few seconds.
+- **Disguised segments.** Some sites hide video segments inside PNG images on image CDNs.
+  `extension/disguise.js` decodes the one format seen so far, and both the player and the relay
+  use it. A segment in an unknown image format fails with an error explaining why.
 - **Headers.** Web pages can't set Referer themselves. So the player asks the background to add a
   `declarativeNetRequest` rule, scoped to the player's tab, that sets Referer and Origin on its
   requests.

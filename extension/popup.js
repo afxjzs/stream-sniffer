@@ -52,53 +52,62 @@ async function copy(btn, text) {
   setTimeout(() => (btn.textContent = label), 1500);
 }
 
+// Streams are only ever appended (a refreshed URL keeps its slot), so new ones are added to the
+// end and existing entries are left alone; rebuilding them would swap buttons out from under a
+// click. Buttons read the latest capture for their slot when clicked.
+let current = [];
+
 function render(captures) {
-  listEl.replaceChildren();
+  current = captures;
+  if (captures.length < listEl.children.length) listEl.replaceChildren(); // tab navigated: list reset
   if (!captures.length) {
     statusEl.textContent = 'No .m3u8 streams seen on this tab yet. Start playback on the page; this list updates live.';
     return;
   }
   statusEl.textContent = `${captures.length} stream${captures.length > 1 ? 's' : ''} seen. The first is usually the master playlist.`;
-  for (const c of captures) {
-    const li = document.createElement('li');
+  for (let i = listEl.children.length; i < captures.length; i++) listEl.append(streamItem(i));
+}
 
-    const url = document.createElement('code');
-    url.className = 'url';
-    url.textContent = c.url;
+function streamItem(i) {
+  const c = current[i];
+  const latest = () => current[i];
+  const li = document.createElement('li');
 
-    const meta = document.createElement('div');
-    meta.className = 'muted small';
-    meta.textContent = c.referer ? `Referer: ${c.referer}` : 'No Referer was sent';
-    if (c.origin) meta.textContent += ` · Origin: ${c.origin}`;
+  const url = document.createElement('code');
+  url.className = 'url';
+  url.textContent = c.url;
 
-    const cmd = vlcCommand(c);
-    const cmdEl = document.createElement('code');
-    cmdEl.className = 'cmd';
-    cmdEl.textContent = cmd;
+  const meta = document.createElement('div');
+  meta.className = 'muted small';
+  meta.textContent = c.referer ? `Referer: ${c.referer}` : 'No Referer was sent';
+  if (c.origin) meta.textContent += ` · Origin: ${c.origin}`;
+  if (c.viaServiceWorker) meta.textContent += ' · fetched by the page\'s service worker';
 
-    const curl = curlCommand(c);
-    const curlEl = document.createElement('code');
-    curlEl.className = 'cmd';
-    curlEl.textContent = curl;
+  const cmdEl = document.createElement('code');
+  cmdEl.className = 'cmd';
+  cmdEl.textContent = vlcCommand(c);
 
-    const actions = document.createElement('div');
-    actions.className = 'actions';
-    actions.append(
-      button('Open in player', () =>
-        openPlayer(c).catch((err) => {
-          console.error('[stream-sniffer] open player failed', err);
-          statusEl.textContent = `Error opening player: ${err.message}`;
-          statusEl.className = 'error';
-        })
-      ),
-      button('Copy VLC command', (e) => copy(e.currentTarget, cmd)),
-      button('Copy curl', (e) => copy(e.currentTarget, curl)),
-      button('Copy URL', (e) => copy(e.currentTarget, c.url))
-    );
+  const curlEl = document.createElement('code');
+  curlEl.className = 'cmd';
+  curlEl.textContent = curlCommand(c);
 
-    li.append(url, meta, actions, cmdEl, curlEl);
-    listEl.append(li);
-  }
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  actions.append(
+    button('Open in player', () =>
+      openPlayer(latest()).catch((err) => {
+        console.error('[stream-sniffer] open player failed', err);
+        statusEl.textContent = `Error opening player: ${err.message}`;
+        statusEl.className = 'error';
+      })
+    ),
+    button('Copy VLC command', (e) => copy(e.currentTarget, vlcCommand(latest()))),
+    button('Copy curl', (e) => copy(e.currentTarget, curlCommand(latest()))),
+    button('Copy URL', (e) => copy(e.currentTarget, latest().url))
+  );
+
+  li.append(url, meta, actions, cmdEl, curlEl);
+  return li;
 }
 
 async function main() {

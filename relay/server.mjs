@@ -15,6 +15,10 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
+import '../extension/disguise.js'; // defines globalThis.StreamSnifferDisguise (shared with the player)
+
+const nodeCodecs = { inflate: async (b) => zlib.inflateSync(b), gunzip: async (b) => zlib.gunzipSync(b) };
 
 const PORT = Number(process.env.RELAY_PORT || 8788);
 const LAN_HOST = process.env.RELAY_HOST || lanAddress();
@@ -120,7 +124,23 @@ async function fetchUpstream(id, stream, upstream) {
     const text = rewritePlaylist(body.toString('utf8'), res.finalUrl, id, stream);
     return { status: 200, isPlaylist, raw: body.toString('utf8'), body: Buffer.from(text), type: 'application/vnd.apple.mpegurl' };
   }
-  // Some CDNs disguise TS segments as images; tell the receiver what they really are.
+  // Some CDNs disguise TS segments as images (see extension/disguise.js). The Chromecast can't
+  // decode those the way the site's own player does, so hand it plain MPEG-TS.
+  if (StreamSnifferDisguise.isPng(body)) {
+    let ts;
+    try {
+      ts = await StreamSnifferDisguise.decodeDisguisedSegment(body, nodeCodecs);
+    } catch (err) {
+      const msg = `couldn't decode ${upstream}: ${err.message}`;
+      recordError(id, stream, msg);
+      return { status: 502, error: msg };
+    }
+    if (!stream.unwrapNoted) {
+      stream.unwrapNoted = true;
+      console.log(`[relay] ${id}: segments are disguised as images; decoding them for the TV`);
+    }
+    return { status: 200, isPlaylist, body: Buffer.from(ts), type: 'video/mp2t' };
+  }
   const realType = /^image\//i.test(type) ? 'video/mp2t' : type || 'application/octet-stream';
   return { status: 200, isPlaylist, body, type: realType };
 }

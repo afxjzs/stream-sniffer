@@ -4,6 +4,41 @@ const errorEl = document.getElementById('error');
 const statusEl = document.getElementById('status');
 const params = new URLSearchParams(location.search);
 let hls = null;
+let unwrapped = 0; // segments that arrived disguised as images and were decoded
+
+const browserCodecs = {
+  inflate: (b) => decompress(b, 'deflate'),
+  gunzip: (b) => decompress(b, 'gzip'),
+};
+async function decompress(bytes, format) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// hls.js fragment loader that decodes image-disguised segments (see disguise.js) before the
+// demuxer sees them. A segment that's an image we can't decode fails loudly with the reason.
+class UnwrapLoader extends Hls.DefaultConfig.loader {
+  load(context, config, callbacks) {
+    super.load(context, config, {
+      ...callbacks,
+      onSuccess: (response, stats, ctx, details) => {
+        const bytes = response.data instanceof ArrayBuffer ? new Uint8Array(response.data) : null;
+        if (!bytes || !StreamSnifferDisguise.isPng(bytes)) return callbacks.onSuccess(response, stats, ctx, details);
+        StreamSnifferDisguise.decodeDisguisedSegment(bytes, browserCodecs).then(
+          (ts) => {
+            response.data = ts.buffer.slice(ts.byteOffset, ts.byteOffset + ts.byteLength);
+            if (unwrapped++ === 0) setStatus(`${statusEl.textContent} · segments are disguised as images; decoding them`);
+            callbacks.onSuccess(response, stats, ctx, details);
+          },
+          (err) => {
+            showError(`Couldn't decode a segment: ${err.message}`);
+            callbacks.onError({ code: 0, text: err.message }, ctx, details, stats);
+          }
+        );
+      },
+    });
+  }
+}
 
 function showError(msg) {
   console.error('[stream-sniffer]', msg);
@@ -37,7 +72,8 @@ async function play({ url, referer, origin }) {
   }
   setStatus(`Loading… (${res.mode})`);
 
-  hls = new Hls();
+  unwrapped = 0;
+  hls = new Hls({ fLoader: UnwrapLoader });
   hls.on(Hls.Events.ERROR, (_e, data) => {
     const code = data.response?.code;
     const detail = `${data.type} / ${data.details}${code ? ` — HTTP ${code}` : ''}${data.url ? ` — ${data.url}` : ''}`;
@@ -49,7 +85,7 @@ async function play({ url, referer, origin }) {
     }
   });
   hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
-    setStatus(`Playing · ${data.levels.length} quality level${data.levels.length === 1 ? '' : 's'} · ${res.mode}`);
+    setStatus(`Playing · ${data.levels.length} quality level${data.levels.length === 1 ? '' : 's'} · ${res.mode}${unwrapped ? ' · segments are disguised as images; decoding them' : ''}`);
     startPlayback();
   });
   hls.loadSource(url);
