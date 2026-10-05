@@ -304,6 +304,18 @@ form.addEventListener('submit', (e) => {
   play(readForm()).catch((err) => showError(err.message));
 });
 
+// Shows which page a popup-opened stream came from, and names the tab after it.
+function showSource(c) {
+  if (!c.pageUrl) return;
+  const label = c.pageTitle || c.pageUrl;
+  const el = document.getElementById('source');
+  const a = el.querySelector('a');
+  a.href = c.pageUrl;
+  a.textContent = c.pageTitle ? `${c.pageTitle} (${c.pageUrl})` : c.pageUrl;
+  el.hidden = false;
+  document.title = `▶ ${label}`;
+}
+
 // Prefill from the popup (?cap=<id> in session storage) or from plain query params, and start.
 async function init() {
   let prefill = { url: params.get('url'), referer: params.get('referer'), origin: params.get('origin') };
@@ -312,6 +324,7 @@ async function init() {
     const { [`cap:${cap}`]: c } = await chrome.storage.session.get(`cap:${cap}`);
     if (!c) throw new Error('This player link has expired (its captured headers are gone). Reopen it from the popup.');
     prefill = c;
+    showSource(c);
   }
   for (const name of ['url', 'referer', 'origin']) form.elements[name].value = prefill[name] || '';
   if (prefill.url) await play(readForm());

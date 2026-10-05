@@ -27,7 +27,20 @@ function enqueue(fn) {
   return queue;
 }
 
+// The page the stream came from, so the player can show it. Title can be blank while the page
+// is still loading; the player falls back to the URL.
+async function pageOf(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return { pageUrl: tab.url || '', pageTitle: tab.title || '' };
+  } catch (err) {
+    console.warn('[stream-sniffer] could not read the source tab', tabId, err);
+    return { pageUrl: '', pageTitle: '' };
+  }
+}
+
 async function addCapture(tabId, capture) {
+  capture = { ...capture, ...(await pageOf(tabId)) };
   const k = key(tabId);
   const { [k]: list = [] } = await chrome.storage.session.get(k);
   const i = list.findIndex((c) => streamKey(c.url) === streamKey(capture.url));

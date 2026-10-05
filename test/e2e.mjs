@@ -215,6 +215,12 @@ async function main() {
     await player.bringToFront();
     const playerTime = await waitForPlayback(player, 'extension player');
     ok(`extension player is playing (t=${playerTime.toFixed(1)}s)`);
+    const sourceText = await waitForText(player, /Fake Sports Site/, 5000);
+    assert(
+      (await player.$eval('a[href]', (a) => a.href).catch(() => '')) === SITE + '/',
+      `player shows where the stream came from ("${sourceText}", linked to ${SITE}/)`
+    );
+    assert((await player.title()).includes('Fake Sports Site'), `player tab title names the source page ("${await player.title()}")`);
     await player.screenshot({ path: path.join(artifactsDir, 'player-from-popup.png') });
 
     step('Player has a one-click Cast button that reports what happened');
