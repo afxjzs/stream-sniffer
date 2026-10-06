@@ -76,7 +76,7 @@ isn't known yet.
 
 A Chromecast fetches video itself, and it can't send the Referer or Origin a stream server
 expects. Some servers go further and reject anything that isn't the browser itself: in testing,
-`curl` and VLC got HTTP 403 even with identical headers.
+`curl` got HTTP 403 even when it sent every header the browser did.
 
 So the relay never fetches the stream itself. The player tab does it:
 
@@ -158,7 +158,7 @@ declined ("The prompt was dismissed") or fell back to mirroring the tab. Use the
 | "Manifest file is missing or unreadable" when loading | Select the `extension` folder, not `stream-sniffer`. |
 | The popup says no streams were seen | Reload the page and press play again. The extension only sees requests made after it was loaded. |
 | The player shows "HTTP 403" | The captured link has probably expired. Many servers use short-lived tokens. Reload the source page and capture it again. |
-| VLC or `curl` gets 403 but the player works | The server only accepts Chrome itself. Use the player or the relay. |
+| VLC or `curl` gets 403 but the player works | The server wants more than the command sends (VLC can't send Origin or cookies), or it only accepts Chrome itself. Use the player or the relay. |
 | "Relay: not running at http://localhost:8788" | Start the relay with `node relay/server.mjs`. |
 | The relay exits with "is not reaching this relay" | Another program is using the port. Pick another with `RELAY_PORT` and update `relayUrl` (see [Settings](#settings)). |
 | The cast controls say Google Cast is unavailable | Use Google Chrome, and check that an ad or script blocker isn't blocking `gstatic.com`. |
