@@ -1,6 +1,8 @@
 // One-off: capture crisp screenshots of the extension (against the fake test site) and a
 // 1200x630 card image for the doug.is project page. Not part of the test suite.
 //   node shots-for-site.mjs <output dir>
+//   STREAM_DIR=<dir with index.m3u8 + seg*.ts> node shots-for-site.mjs <output dir>
+//     plays your own HLS stream in the player shot instead of the test pattern.
 import puppeteer from 'puppeteer';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -13,8 +15,10 @@ const out = process.argv[2];
 if (!out) throw new Error('usage: node shots-for-site.mjs <output dir>');
 fs.mkdirSync(out, { recursive: true });
 
+const streamDir = process.env.STREAM_DIR || path.join(here, 'fixtures/stream');
+console.log(`stream: ${process.env.STREAM_DIR ? `custom (STREAM_DIR=${streamDir})` : 'test pattern'}`);
 const servers = await startServers({
-  streamDir: path.join(here, 'fixtures/stream'),
+  streamDir,
   hlsJsPath: path.join(extDir, 'vendor/hls.min.js'),
 });
 const browser = await puppeteer.launch({
@@ -64,7 +68,7 @@ try {
   await player.setViewport({ width: 1100, height: 640, deviceScaleFactor: 2 });
   await player.bringToFront();
   await player.waitForFunction(() => (document.querySelector('video')?.currentTime ?? 0) > 2, { timeout: 20000 });
-  await player.screenshot({ path: path.join(out, 'player.png') });
+  await player.screenshot({ path: path.join(out, 'player.png'), fullPage: true });
 
   // Card: title, one line, and the popup screenshot, on the site's dark background.
   const popupData = fs.readFileSync(path.join(out, 'popup.png')).toString('base64');
