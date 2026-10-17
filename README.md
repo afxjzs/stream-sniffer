@@ -55,7 +55,9 @@ To update later, run `git pull`, then click the reload icon (↻) on the extensi
    - **Copy curl** copies a `curl` command that repeats the browser's request with every header.
      It's useful for testing what a stream server accepts.
    - **Copy URL** copies the playlist address.
-4. To play a URL you already have, click **Open player** at the top of the popup. Then paste the
+4. In the player, **Pop out** moves the video into a small floating window that stays on top of
+   other apps. Click **Back to tab** (or close the floating window) to return it.
+5. To play a URL you already have, click **Open player** at the top of the popup. Then paste the
    stream URL, plus a Referer if the server needs one.
 
 The first playlist in the list is usually the master playlist. That's the one to pick. If a page
@@ -144,12 +146,6 @@ chrome.storage.local.set({ relayUrl: 'http://localhost:9000' })
 ```
 
 The player shows the relay address in its status messages, so you can confirm which one it uses.
-
-## Cast via Chrome
-
-The player also has a **Cast via Chrome** button. It asks Chrome to cast the video element using
-Chrome's built-in casting. In testing so far, Chrome hasn't cast the stream this way: it either
-declined ("The prompt was dismissed") or fell back to mirroring the tab. Use the relay instead.
 
 ## Troubleshooting
 

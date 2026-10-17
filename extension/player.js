@@ -135,40 +135,22 @@ async function startPlayback() {
   }
 }
 
-// Cast via the Remote Playback API. For an hls.js (Media Source) video, Chrome can only do
-// this with "media remoting": this browser keeps fetching the stream (with the rewritten
-// headers) and forwards the encoded video to the Chromecast. Whether Chrome offers that for
-// a given video is Chrome's call, so every outcome is reported to the user.
-const castBtn = document.getElementById('cast');
+// Pop the video out into Chrome's floating picture-in-picture window, or bring it back. The
+// label follows the real state, so closing the floating window by hand updates it too.
+const popoutBtn = document.getElementById('popout');
 const castStatus = document.getElementById('cast-status');
-const setCast = (msg) => (castStatus.textContent = `Cast: ${msg}`);
-
-if (!video.remote) {
-  castBtn.disabled = true;
-  setCast('this browser has no Remote Playback API.');
-} else {
-  video.remote.addEventListener('connecting', () => setCast('connecting…'));
-  video.remote.addEventListener('connect', () => setCast('casting to TV.'));
-  video.remote.addEventListener('disconnect', () => setCast('disconnected.'));
-  castBtn.addEventListener('click', async () => {
-    if (!hls) {
-      setCast('start a stream first.');
-      return;
-    }
-    if (video.remote.state !== 'disconnected') {
-      setCast(`already ${video.remote.state}; use the device picker to stop.`);
-    }
-    try {
-      setCast('opening device picker…');
-      await video.remote.prompt();
-    } catch (err) {
-      // NotAllowedError covers both "user closed the picker" and "Chrome refused to show it",
-      // so always show Chrome's own message rather than guessing which.
-      console.error('[stream-sniffer] remote.prompt failed', err);
-      setCast(`${err.name}: ${err.message}`);
-    }
-  });
-}
+const syncPopout = () => (popoutBtn.textContent = document.pictureInPictureElement ? 'Back to tab' : 'Pop out');
+video.addEventListener('enterpictureinpicture', syncPopout);
+video.addEventListener('leavepictureinpicture', syncPopout);
+popoutBtn.addEventListener('click', async () => {
+  try {
+    if (document.pictureInPictureElement) await document.exitPictureInPicture();
+    else if (!hls) showError('Start a stream first, then pop it out.');
+    else await video.requestPictureInPicture();
+  } catch (err) {
+    showError(`Couldn't pop out the video: ${err.name}: ${err.message}`);
+  }
+});
 
 // Cast via the relay. Some stream servers only answer Chrome itself, so this tab does all the
 // fetching: it long-polls the relay for URLs the TV wants, fetches them here (where the

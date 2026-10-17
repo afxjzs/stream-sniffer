@@ -223,26 +223,13 @@ async function main() {
     assert((await player.title()).includes('Fake Sports Site'), `player tab title names the source page ("${await player.title()}")`);
     await player.screenshot({ path: path.join(artifactsDir, 'player-from-popup.png') });
 
-    step('Player has a one-click Cast button that reports what happened');
-    // Headless Chrome has no cast devices, so the outcome we can check is that clicking
-    // the button tells the user something instead of doing nothing.
-    const castBtn = await player.waitForSelector('button::-p-text(Cast via Chrome)', { visible: true, timeout: 5000 });
-    assert(castBtn, '"Cast via Chrome" button is visible on the player page');
-    await castBtn.click();
-    // Wait for the outcome, not the in-progress "…" message.
-    const castMsg = await (
-      await player.waitForFunction(
-        () => {
-          const el = [...document.querySelectorAll('body *')].find(
-            (e) => e.children.length === 0 && e.textContent.startsWith('Cast:')
-          );
-          return el && !el.textContent.endsWith('…') ? el.textContent : false;
-        },
-        { timeout: 10000, polling: 100 }
-      )
-    ).jsonValue();
-    ok(`clicking Cast reports: "${castMsg}"`);
-    await player.screenshot({ path: path.join(artifactsDir, 'player-cast.png') });
+    step('"Pop out" puts the video in a floating picture-in-picture window, and can bring it back');
+    await player.click('button::-p-text(Pop out)');
+    await player.waitForFunction(() => document.pictureInPictureElement?.tagName === 'VIDEO', { timeout: 5000 });
+    ok('video is in picture-in-picture');
+    await player.click('button::-p-text(Back to tab)');
+    await player.waitForFunction(() => !document.pictureInPictureElement, { timeout: 5000 });
+    ok('video is back in the tab');
 
     step('"Cast via relay" without the relay running says how to start it');
     await player.click('button::-p-text(Cast via relay)');
