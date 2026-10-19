@@ -6,26 +6,34 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body class="player">
-  <p id="source" class="muted small" hidden>From <a target="_blank" rel="noopener"></a></p>
-  <form id="form">
-    <label>Stream URL <input name="url" type="url" required placeholder="https://…/index.m3u8"></label>
-    <label>Referer <input name="referer" type="url" placeholder="https://embed-site/ (optional)"></label>
-    <label>Origin <input name="origin" type="url" placeholder="https://embed-site (optional)"></label>
-    <button type="submit">Play</button>
-  </form>
-  <div id="error" class="error" hidden></div>
-  <div class="bar">
-    <p id="status" class="muted"></p>
-    <span class="actions">
+  <!-- Two video elements: one fills the tab, the other floats small on top. Clicking the small
+       one swaps them. Each keeps its own stream, so a swap reloads nothing. -->
+  <video class="big" controls playsinline></video>
+  <video class="small" playsinline hidden title="Click to swap with the big picture. Drag to move; drag a corner to resize."></video>
+  <!-- Follows the small picture around (a video element can't hold children). -->
+  <button id="remove-small" type="button" hidden aria-label="Remove the small stream" title="Remove the small stream">×</button>
+
+  <!-- Errors and buffering, over the video, only while something is wrong. -->
+  <div id="problems"></div>
+
+  <button id="settings" type="button" aria-label="Settings" aria-expanded="false" title="Settings">⚙</button>
+  <div id="menu" hidden>
+    <div id="streams"></div>
+    <form id="form">
+      <p class="muted small">Play a URL on the big screen</p>
+      <label>Stream URL <input name="url" type="url" required placeholder="https://…/index.m3u8"></label>
+      <label>Referer <input name="referer" type="url" placeholder="https://embed-site/ (optional)"></label>
+      <label>Origin <input name="origin" type="url" placeholder="https://embed-site (optional)"></label>
+      <button type="submit">Play</button>
+    </form>
+    <div class="actions">
       <button id="popout" type="button" title="Play in a floating window that stays on top">Pop out</button>
       <button id="relay" type="button" title="Experimental: needs the relay running (node relay/server.mjs)">Cast via relay (beta)</button>
-    </span>
+    </div>
+    <p id="cast-status" class="muted small"></p>
+    <!-- The relay's cast page. It can load Google's Cast SDK, which extension pages can't. -->
+    <iframe id="cast-frame" hidden title="Cast controls"></iframe>
   </div>
-  <p id="health" class="small"></p>
-  <p id="cast-status" class="muted small"></p>
-  <!-- The relay's cast page. It can load Google's Cast SDK, which extension pages can't. -->
-  <iframe id="cast-frame" hidden title="Cast controls"></iframe>
-  <video id="video" controls playsinline></video>
   <script src="vendor/hls.min.js"></script>
   <script src="disguise.js"></script>
   <script src="player.js"></script>

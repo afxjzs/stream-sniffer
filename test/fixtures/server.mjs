@@ -3,6 +3,9 @@
 //   embed (127.0.0.1:8002)  - the iframe; plays HLS with hls.js
 //   cdn   (localhost:8003)  - serves the stream, but ONLY with an embed Referer and a token,
 //                             and only sends CORS headers for the embed origin
+//   cdn2  (127.0.0.1:8004)  - the same stream for /second, which plays it in the top page, so
+//                             this CDN wants the SITE's Referer instead. Two streams that need
+//                             different headers, for the multi-stream player.
 //
 // /tricky on the site mimics two real-world tricks: the embed fetches the stream through a
 // service worker (Chrome reports those requests with no tab), and the stream's segments are
@@ -19,6 +22,8 @@ export const CDN = 'http://localhost:8003';
 export const TOKEN = 'abc123';
 export const MASTER_URL = `${CDN}/live/master.m3u8?token=${TOKEN}`;
 export const PNG_MASTER_URL = `${CDN}/live/png/master.m3u8?token=${TOKEN}`;
+export const CDN2 = 'http://127.0.0.1:8004';
+export const CDN2_MASTER_URL = `${CDN2}/live/master.m3u8?token=${TOKEN}`;
 
 // Wraps a TS segment the way a live site does (see extension/disguise.js): an RGB PNG whose
 // pixel bytes are "TIKTIKPX" + uint32 length + gzip(TS). Rows cycle through all five PNG
@@ -79,6 +84,17 @@ function disguiseAsPng(ts) {
 
 export function startServers({ streamDir, hlsJsPath }) {
   const site = http.createServer((req, res) => {
+    if (req.url.startsWith('/second')) {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end(`<!doctype html><title>Second Game</title>
+<video id="v" autoplay muted playsinline width="640"></video>
+<script src="${EMBED}/hls.min.js"></script>
+<script>
+  const hls = new Hls();
+  hls.loadSource(${JSON.stringify(CDN2_MASTER_URL)});
+  hls.attachMedia(document.getElementById('v'));
+</script>`);
+    }
     const embedPath = req.url.startsWith('/tricky') ? '/embed?tricky=1' : '/embed';
     res.writeHead(200, { 'content-type': 'text/html' });
     res.end(`<!doctype html><title>Fake Sports Site</title>
@@ -122,19 +138,53 @@ self.addEventListener('fetch', (e) => {
 
   const rejected = [];
   const served = [];
-  const cdn = http.createServer((req, res) => {
-    const url = new URL(req.url, CDN);
+  const liveStart = {}; // per live stream: when it was first requested
+  let rotation = 0;
+  let flakyRefreshes = 0;
+  // allowed: the Referer prefix and CORS origin this CDN accepts.
+  const makeCdn = (base, allowed) => http.createServer((req, res) => {
+    const url = new URL(req.url, base);
     const referer = req.headers.referer || '';
-    if (!referer.startsWith(EMBED + '/') || url.searchParams.get('token') !== TOKEN) {
-      rejected.push({ url: req.url, referer });
+    if (!referer.startsWith(allowed + '/') || url.searchParams.get('token') !== TOKEN) {
+      rejected.push({ url: base + req.url, referer });
       res.writeHead(403, { 'content-type': 'text/plain' });
       return res.end('forbidden');
     }
     served.push(req.url);
     const headers = {};
-    if (req.headers.origin === EMBED) headers['access-control-allow-origin'] = EMBED;
+    if (req.headers.origin === allowed) headers['access-control-allow-origin'] = allowed;
 
-    if (url.pathname === '/live/master.m3u8' || url.pathname === '/live/png/master.m3u8') {
+    // Live streams (2 s segments, 3 in the window, starting when first requested).
+    // /live/rot/: segment paths get a new prefix on every refresh, as some CDNs do with rotating
+    // tokens. The segment itself doesn't change.
+    // /live/flaky/: the third playlist refresh fails with a 503, as a CDN whose backend blips.
+    const live = url.pathname.match(/^\/live\/(rot|flaky)\/index\.m3u8$/);
+    if (live) {
+      if (live[1] === 'flaky' && ++flakyRefreshes === 3) {
+        res.writeHead(503, { ...headers, 'content-type': 'text/plain' });
+        return res.end('Backend fetch failed');
+      }
+      liveStart[live[1]] ??= Date.now();
+      const edge = Math.floor((Date.now() - liveStart[live[1]]) / 2000) + 2;
+      const first = Math.max(0, edge - 2);
+      const prefix = live[1] === 'rot' ? `p${++rotation}` : 'p0';
+      let body = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:${first}\n`;
+      for (let sn = first; sn <= edge; sn++) body += `#EXTINF:2.000,\n${prefix}/seg${sn % 10}.ts?token=${TOKEN}\n`;
+      res.writeHead(200, { ...headers, 'content-type': 'application/vnd.apple.mpegurl' });
+      return res.end(body);
+    }
+    const rotSeg = url.pathname.match(/^\/live\/(?:rot|flaky)\/p\d+\/(seg\d+\.ts)$/);
+    if (rotSeg) {
+      res.writeHead(200, { ...headers, 'content-type': 'video/mp2t' });
+      return res.end(fs.readFileSync(path.join(streamDir, rotSeg[1])));
+    }
+    // /live/broken/: the variant playlist comes back as an HTML error page, as a flaky live CDN
+    // sometimes does.
+    if (url.pathname === '/live/broken/index.m3u8') {
+      res.writeHead(200, { ...headers, 'content-type': 'text/html' });
+      return res.end('<html><body><h1>503 Service Unavailable</h1></body></html>');
+    }
+    if (['/live/master.m3u8', '/live/png/master.m3u8', '/live/broken/master.m3u8', '/live/rot/master.m3u8', '/live/flaky/master.m3u8'].includes(url.pathname)) {
       res.writeHead(200, { ...headers, 'content-type': 'application/vnd.apple.mpegurl' });
       return res.end(
         `#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=320x240\nindex.m3u8?token=${TOKEN}\n`
@@ -161,11 +211,14 @@ self.addEventListener('fetch', (e) => {
     });
     res.end(body);
   });
+  const cdn = makeCdn(CDN, EMBED);
+  const cdn2 = makeCdn(CDN2, SITE);
 
   const servers = [
     [site, 8001],
     [embed, 8002],
     [cdn, 8003],
+    [cdn2, 8004],
   ];
   return Promise.all(
     servers.map(

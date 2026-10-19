@@ -51,13 +51,25 @@ To update later, run `git pull`, then click the reload icon (↻) on the extensi
    Click the icon.
 3. Each playlist in the popup has these buttons:
    - **Open in player** plays the stream in a new tab, sending the captured Referer and Origin.
+   - **Add to player** adds the stream to the player tab you used last, as a small picture over
+     the big one (or replaces the small one). With no player tab open, it opens one.
    - **Copy VLC command** copies a terminal command that plays the stream in VLC.
    - **Copy curl** copies a `curl` command that repeats the browser's request with every header.
      It's useful for testing what a stream server accepts.
    - **Copy URL** copies the playlist address.
-4. In the player, **Pop out** moves the video into a small floating window that stays on top of
-   other apps. Click **Back to tab** (or close the floating window) to return it.
-5. To play a URL you already have, click **Open player** at the top of the popup. Then paste the
+4. The player fills the tab with the video. With two streams, the second floats in a corner;
+   click it to swap the two pictures. Drag it to move it, or drag a corner to resize it; the
+   player remembers where you put it. Click its **×** to remove it. The sound always follows
+   the big picture. Each stream
+   gets its own Referer and Origin, so the two can come from different sites. Problems
+   (errors, buffering, failed requests the player is retrying) show over the video while they
+   last. Live streams just play: if a video pauses (from its controls, a media key, or Chrome
+   itself), the player starts it again at once and notes it in the ⚙ menu.
+5. The ⚙ button opens the player menu: where each stream came from, its status, a form to play
+   another URL on the big screen, **Pop out**, and the relay. **Pop out** moves the big video into
+   a small floating window that stays on top of other apps. Click **Back to tab** (or close the
+   floating window) to return it.
+6. To play a URL you already have, click **Open player** at the top of the popup. Then paste the
    stream URL, plus a Referer if the server needs one.
 
 The first playlist in the list is usually the master playlist. That's the one to pick. If a page
@@ -101,8 +113,8 @@ and then `[relay] ready`.
 ### Cast
 
 1. Open a stream in the player (**Open in player** in the popup).
-2. Click **Cast via relay (beta)**. The player checks the stream, then shows the cast controls
-   below the buttons.
+2. Open the ⚙ menu and click **Cast via relay (beta)**. It casts the big picture's stream. The
+   player checks the stream, then shows the cast controls below the buttons.
 3. Click **Cast to TV** and choose your Chromecast.
 
 Playback on your computer stops when the TV takes over, so the stream isn't downloaded twice.
@@ -189,7 +201,7 @@ The player shows the relay address in its status messages, so you can confirm wh
 extension/        The Chrome extension (load this folder unpacked)
   background.js   Captures playlists and headers; manages header rules
   popup.*         Toolbar popup listing captured streams
-  player.*        Player tab, cast buttons, and the relay fetch loop
+  player.*        Player tab (big and small picture, ⚙ menu) and the relay fetch loop
   vendor/         hls.js and its license
 relay/
   server.mjs      The Chromecast relay (Node, no dependencies)
@@ -210,6 +222,13 @@ It checks what a user would see:
 - The popup lists the captured playlist.
 - The VLC and `curl` commands carry headers the stream server accepts.
 - The player plays the stream.
+- Two streams that need different Referers play side by side in one player tab (the fake site has
+  a second stream server for this), swap picture and sound on a click, and both come back after a
+  reload.
+- A live stream whose segment URLs change on every playlist refresh keeps playing, and the player
+  says what hls.js skipped. A "playlist" that's really an HTML error page fails with what the
+  server sent. A playlist refresh that fails once shows while it's retried and clears when the
+  next one works. A pause is undone at once and noted.
 - The relay serves playlists and video to a client that sends no special headers, as a Chromecast
   would.
 - The relay refuses hosts outside the stream.

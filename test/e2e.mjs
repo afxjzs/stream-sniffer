@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { startServers, SITE, EMBED, MASTER_URL } from './fixtures/server.mjs';
+import { startServers, SITE, EMBED, MASTER_URL, CDN2_MASTER_URL } from './fixtures/server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const extDir = path.resolve(here, '../extension');
@@ -223,6 +223,16 @@ async function main() {
     assert((await player.title()).includes('Fake Sports Site'), `player tab title names the source page ("${await player.title()}")`);
     await player.screenshot({ path: path.join(artifactsDir, 'player-from-popup.png') });
 
+    step('The video fills the tab; the controls sit behind a settings button');
+    const fills = await player.$eval('video', (v) => {
+      const r = v.getBoundingClientRect();
+      return r.width === innerWidth && r.height === innerHeight;
+    });
+    assert(fills, 'video covers the whole tab');
+    await player.click('::-p-aria(Settings)');
+    await player.waitForSelector('input[name=url]', { visible: true, timeout: 5000 });
+    ok('settings menu shows the stream form');
+
     step('"Pop out" puts the video in a floating picture-in-picture window, and can bring it back');
     await player.click('button::-p-text(Pop out)');
     await player.waitForFunction(() => document.pictureInPictureElement?.tagName === 'VIDEO', { timeout: 5000 });
@@ -230,6 +240,111 @@ async function main() {
     await player.click('button::-p-text(Back to tab)');
     await player.waitForFunction(() => !document.pictureInPictureElement, { timeout: 5000 });
     ok('video is back in the tab');
+    await player.click('::-p-aria(Settings)'); // close the menu
+
+    step('"Add to player" puts a stream that needs other headers in a small window; clicking it swaps picture and sound');
+    servers.rejected.length = 0;
+    const second = await browser.newPage();
+    await second.goto(SITE + '/second');
+    await waitForPlayback(second, "second site's own player");
+    await second.bringToFront();
+    const popup3P = browser.waitForTarget((t) => t.url().includes('/popup.html') && t !== popupTarget, { timeout: 5000 });
+    await ext.triggerAction(second);
+    const popup3Target = await popup3P;
+    const popup3 = await popup3Target.asPage();
+    await popup3.waitForSelector(`::-p-text(${CDN2_MASTER_URL})`, { timeout: 5000 });
+    await popup3.click('button::-p-text(Add to player)');
+    const sizes = () =>
+      player.$$eval('video', (vs) =>
+        vs.filter((v) => !v.hidden).map((v) => {
+          const r = v.getBoundingClientRect();
+          return { area: r.width * r.height, muted: v.muted, t: v.currentTime };
+        })
+      );
+    await player.waitForFunction(
+      () => [...document.querySelectorAll('video')].filter((v) => !v.hidden && v.currentTime >= 1.5).length === 2,
+      { timeout: 20000, polling: 250 }
+    );
+    let [a, b] = await sizes();
+    assert(b.area < a.area / 4, `second stream plays in a small window over the first (areas ${a.area} / ${b.area})`);
+    assert(b.muted, 'the small window is muted');
+    assert(servers.rejected.length === 0, `both CDNs accepted the headers sent (${JSON.stringify(servers.rejected)})`);
+    const [bigEl, smallEl] = await player.$$('video');
+    await smallEl.click();
+    [a, b] = await sizes();
+    assert(b.area > a.area * 4, 'after clicking it, the small one is now big');
+    assert(!b.muted && a.muted, 'and the sound moved with it');
+    await bigEl.click(); // bigEl is the small one now
+    [a, b] = await sizes();
+    assert(a.area > b.area * 4, 'clicking again swaps back');
+
+    const smallRect = () =>
+      player.$$eval('video', (vs) => {
+        const r = vs.filter((v) => !v.hidden).map((v) => v.getBoundingClientRect()).sort((p, q) => p.width - q.width)[0];
+        return { x: r.x, y: r.y, w: r.width, h: r.height };
+      });
+    const drag = async (fromX, fromY, dx, dy) => {
+      await player.mouse.move(fromX, fromY);
+      await player.mouse.down();
+      await player.mouse.move(fromX + dx, fromY + dy, { steps: 8 });
+      await player.mouse.up();
+    };
+    const before = await smallRect();
+    await drag(before.x + before.w / 2, before.y + before.h / 2, -200, -100);
+    const moved = await smallRect();
+    assert(
+      Math.abs(moved.x - (before.x - 200)) < 2 && Math.abs(moved.y - (before.y - 100)) < 2 && moved.w === before.w,
+      `dragging the small window moves it (${JSON.stringify(before)} -> ${JSON.stringify(moved)})`
+    );
+    [a, b] = await sizes();
+    assert(a.area > b.area * 4, 'dragging it does not swap');
+    await drag(moved.x + 3, moved.y + 3, -100, 0); // top-left corner, outward
+    const resized = await smallRect();
+    assert(
+      Math.abs(resized.w - (moved.w + 100)) < 2 && Math.abs(resized.x + resized.w - (moved.x + moved.w)) < 2,
+      `dragging a corner resizes it, keeping the opposite corner in place (${JSON.stringify(moved)} -> ${JSON.stringify(resized)})`
+    );
+
+    // After a reload both streams load at the same time, each needing its own headers.
+    await player.reload();
+    await player
+      .waitForFunction(
+        () => [...document.querySelectorAll('video')].filter((v) => !v.hidden && v.currentTime >= 1.5).length === 2,
+        { timeout: 20000, polling: 250 }
+      )
+      .catch((err) => {
+        throw new Error(`after a reload, both streams did not play (CDN rejected: ${JSON.stringify(servers.rejected)}): ${err.message}`);
+      });
+    [a, b] = await sizes();
+    assert(a.area > b.area * 4, 'a reload brings back both pictures, same one big');
+    const afterReload = await smallRect();
+    assert(
+      Math.abs(afterReload.x - resized.x) < 2 && Math.abs(afterReload.w - resized.w) < 2,
+      `the small window keeps its place and size (${JSON.stringify(afterReload)})`
+    );
+    assert(servers.rejected.length === 0, `both CDNs still accepted every request (${JSON.stringify(servers.rejected)})`);
+    await player.screenshot({ path: path.join(artifactsDir, 'player-two-streams.png') });
+    await player.click('::-p-aria(Settings)');
+    await player.screenshot({ path: path.join(artifactsDir, 'player-menu.png') });
+    await player.click('::-p-aria(Settings)'); // close the menu
+
+    await player.click('::-p-aria(Remove the small stream)');
+    const visible = () => player.$$eval('video', (vs) => vs.filter((v) => !v.hidden).length);
+    await player.waitForFunction(() => [...document.querySelectorAll('video')].filter((v) => !v.hidden).length === 1, {
+      timeout: 5000,
+      polling: 100,
+    });
+    const keptT = await player.evaluate(() => [...document.querySelectorAll('video')].find((v) => !v.hidden).currentTime);
+    await player.waitForFunction(
+      (t) => [...document.querySelectorAll('video')].find((v) => !v.hidden).currentTime >= t + 1,
+      { timeout: 5000, polling: 250 },
+      keptT
+    );
+    ok('the × on the small window removes it; the big one keeps playing');
+    await player.reload();
+    await waitForPlayback(player, 'player after removing the small stream and reloading');
+    assert((await visible()) === 1, 'it stays removed after a reload');
+    await player.click('::-p-aria(Settings)');
 
     step('"Cast via relay" without the relay running says how to start it');
     await player.click('button::-p-text(Cast via relay)');
@@ -274,7 +389,10 @@ async function main() {
     await tricky.goto(SITE + '/tricky');
     await tricky.waitForFrame((f) => f.url().startsWith(EMBED));
     await tricky.bringToFront();
-    const popup2P = browser.waitForTarget((t) => t.url().includes('/popup.html') && t !== popupTarget, { timeout: 5000 });
+    const popup2P = browser.waitForTarget(
+      (t) => t.url().includes('/popup.html') && t !== popupTarget && t !== popup3Target,
+      { timeout: 5000 }
+    );
     await ext.triggerAction(tricky);
     const popup2 = await (await popup2P).asPage();
     await popup2.waitForSelector('::-p-text(png/master.m3u8)', { timeout: 5000 });
@@ -289,6 +407,7 @@ async function main() {
     await trickyPlayer.bringToFront();
     await waitForPlayback(trickyPlayer, 'extension player on PNG-disguised stream');
     ok('extension player plays the PNG-disguised stream');
+    await trickyPlayer.click('::-p-aria(Settings)');
     await trickyPlayer.click('button::-p-text(Cast via relay)');
     const trickyFrame = await trickyPlayer.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
     const trickyMedia = (await waitForText(trickyFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
@@ -307,15 +426,68 @@ async function main() {
     await manual.goto(`chrome-extension://${ext.id}/player.html`);
     await manual.type('input[name=url]', MASTER_URL);
     await manual.type('input[name=referer]', EMBED + '/');
-    await manual.click('::-p-text(Play)');
+    await manual.click('button::-p-text(Play)');
     const manualTime = await waitForPlayback(manual, 'manual player');
     ok(`manual mode plays (t=${manualTime.toFixed(1)}s)`);
+
+    step('A playlist the server garbles shows why it failed and what the server sent');
+    const garbled = await browser.newPage();
+    await garbled.goto(`chrome-extension://${ext.id}/player.html`);
+    await garbled.type('input[name=url]', MASTER_URL.replace('/live/', '/live/broken/'));
+    await garbled.type('input[name=referer]', EMBED + '/');
+    await garbled.click('button::-p-text(Play)');
+    // A garbled reply is retried like a failed load, so this takes a few seconds.
+    const garbledMsg = await waitForText(garbled, /Playback failed.*EXTM3U.*503 Service Unavailable/, 30000);
+    ok(`player reports: "${garbledMsg}"`);
+
+    step('A live stream whose segment URLs change on every refresh keeps playing, and the player says what it skipped');
+    const rot = await browser.newPage();
+    await rot.goto(`chrome-extension://${ext.id}/player.html`);
+    await rot.type('input[name=url]', MASTER_URL.replace('/live/', '/live/rot/'));
+    await rot.type('input[name=referer]', EMBED + '/');
+    await rot.click('button::-p-text(Play)');
+    const rotStart = await waitForPlayback(rot, 'rotating live stream', 0.1);
+    // The first playlist holds 6 s; playing 9 s more needs refreshes with the new URLs.
+    const rotEnd = await waitForPlayback(rot, 'rotating live stream after refreshes', rotStart + 9, 30000);
+    ok(`kept playing across refreshes (${rotStart.toFixed(1)}s -> ${rotEnd.toFixed(1)}s)`);
+    const rotNote = await waitForText(rot, /skipped \d+ playlist problems?.*media sequence mismatch/);
+    ok(`stream status says: "${rotNote.slice(0, 160)}…"`);
+
+    step('A playlist refresh that fails once shows while it is retried, then clears; a pause is undone');
+    const flaky = await browser.newPage();
+    await flaky.goto(`chrome-extension://${ext.id}/player.html`);
+    await flaky.type('input[name=url]', MASTER_URL.replace('/live/', '/live/flaky/'));
+    await flaky.type('input[name=referer]', EMBED + '/');
+    await flaky.click('button::-p-text(Play)');
+    await flaky.click('::-p-aria(Settings)'); // close the menu; problems show over the video
+    // Mutation polling sees the line however briefly it shows.
+    const overlay = (re) =>
+      flaky.waitForFunction((src) => new RegExp(src).test(document.getElementById('problems').textContent), {
+        timeout: 20000,
+        polling: 'mutation',
+      }, re.source);
+    await overlay(/503/);
+    ok('the failed refresh shows over the video while it is retried');
+    await flaky.waitForFunction(() => !document.getElementById('problems').textContent, { timeout: 15000, polling: 250 });
+    const flakyT = await flaky.evaluate(() => document.querySelector('video').currentTime);
+    await waitForPlayback(flaky, 'flaky live stream after the retry', flakyT + 2);
+    ok('it clears once the next refresh works, and playback goes on');
+
+    // Live streams just play: a pause, from the controls or the browser, is undone and noted.
+    await flaky.focus('video');
+    await flaky.keyboard.press('Space'); // the video's own pause key
+    const pausedT = await flaky.evaluate(() => document.querySelector('video').currentTime);
+    await waitForPlayback(flaky, 'flaky live stream after a pause', pausedT + 1, 5000);
+    await flaky.click('::-p-aria(Settings)');
+    const resumeNote = await waitForText(flaky, /resumed after 1 pause/i);
+    ok(`a pause is undone at once and noted in the status: "${resumeNote.slice(0, 160)}"`);
+    await flaky.close();
 
     step('Manual mode without a Referer fails loudly, not silently');
     const bad = await browser.newPage();
     await bad.goto(`chrome-extension://${ext.id}/player.html`);
     await bad.type('input[name=url]', MASTER_URL);
-    await bad.click('::-p-text(Play)');
+    await bad.click('button::-p-text(Play)');
     await bad.waitForSelector('::-p-text(403)', { timeout: 10000 });
     ok('player shows the 403 error to the user');
     await bad.screenshot({ path: path.join(artifactsDir, 'player-403.png') });

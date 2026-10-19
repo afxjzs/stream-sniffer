@@ -33,6 +33,24 @@ async function openPlayer(c) {
   await chrome.tabs.create({ url: chrome.runtime.getURL(`player.html?cap=${id}`) });
 }
 
+// Adds the stream to the player tab used last, as its small picture (or as its only one if
+// it has none). With no player tab open, opens one.
+async function addToPlayer(c) {
+  const playerUrl = chrome.runtime.getURL('player.html');
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['TAB'] });
+  const tabIds = contexts.filter((x) => x.documentUrl.startsWith(playerUrl)).map((x) => x.tabId);
+  if (!tabIds.length) return openPlayer(c);
+  const tabs = await Promise.all(tabIds.map((id) => chrome.tabs.get(id)));
+  if (tabs.some((t) => t.lastAccessed == null)) throw new Error("this Chrome doesn't say which player tab was used last");
+  const target = tabs.reduce((a, b) => (b.lastAccessed > a.lastAccessed ? b : a));
+  const id = crypto.randomUUID();
+  await chrome.storage.session.set({ [`cap:${id}`]: c });
+  const res = await chrome.runtime.sendMessage({ type: 'add-stream', tabId: target.id, capId: id });
+  if (!res?.ok) throw new Error(res?.error ?? 'the player tab did not answer');
+  await chrome.tabs.update(target.id, { active: true });
+  await chrome.windows.update(target.windowId, { focused: true });
+}
+
 function button(label, onClick) {
   const b = document.createElement('button');
   b.textContent = label;
@@ -98,6 +116,13 @@ function streamItem(i) {
       openPlayer(latest()).catch((err) => {
         console.error('[stream-sniffer] open player failed', err);
         statusEl.textContent = `Error opening player: ${err.message}`;
+        statusEl.className = 'error';
+      })
+    ),
+    button('Add to player', () =>
+      addToPlayer(latest()).catch((err) => {
+        console.error('[stream-sniffer] add to player failed', err);
+        statusEl.textContent = `Error adding to player: ${err.message}`;
         statusEl.className = 'error';
       })
     ),
