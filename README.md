@@ -184,9 +184,11 @@ The player shows the relay address in its status messages, so you can confirm wh
   those requests without a tab. The extension credits them to the tab with a frame from the
   worker's site. Players that add a cache-buster to each refresh (`?_=1791240957421`) show up
   as one stream, not a new one every few seconds.
-- **Disguised segments.** Some sites hide video segments inside PNG images on image CDNs.
-  `extension/disguise.js` decodes the one format seen so far, and both the player and the relay
-  use it. A segment in an unknown image format fails with an error explaining why.
+- **Disguised segments.** Some sites hide video segments inside images on image CDNs.
+  `extension/disguise.js` decodes the two formats seen so far (video packed into a PNG's pixels,
+  and video stored in a WebP's EXIF chunk), and both the player and the relay use it. Before
+  casting, the relay fetches the first segment, so one in an image format it can't decode stops
+  the cast with an error that says why, instead of leaving the TV buffering.
 - **Headers.** Web pages can't set Referer themselves. So the player asks the background to add a
   `declarativeNetRequest` rule, scoped to the player's tab, that sets Referer and Origin on its
   requests.
@@ -235,6 +237,8 @@ It checks what a user would see:
 - The relay serves playlists and video to a client that sends no special headers, as a Chromecast
   would.
 - The relay refuses hosts outside the stream.
+- Segments disguised as PNG or WebP images play in the player and reach the TV as plain
+  MPEG-TS. A segment in an image format nobody decodes stops the cast with a reason.
 - Failures, such as a 403 or a relay that isn't running, show up on screen.
 
 To run it you need `ffmpeg` on your PATH. The first run uses it to generate a short test stream.

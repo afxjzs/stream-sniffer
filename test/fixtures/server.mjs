@@ -22,6 +22,8 @@ export const CDN = 'http://localhost:8003';
 export const TOKEN = 'abc123';
 export const MASTER_URL = `${CDN}/live/master.m3u8?token=${TOKEN}`;
 export const PNG_MASTER_URL = `${CDN}/live/png/master.m3u8?token=${TOKEN}`;
+export const WEBP_MASTER_URL = `${CDN}/live/webp/master.m3u8?token=${TOKEN}`;
+export const GIF_MASTER_URL = `${CDN}/live/gif/master.m3u8?token=${TOKEN}`;
 export const CDN2 = 'http://127.0.0.1:8004';
 export const CDN2_MASTER_URL = `${CDN2}/live/master.m3u8?token=${TOKEN}`;
 
@@ -81,6 +83,32 @@ function disguiseAsPng(ts) {
     chunk('IEND', Buffer.alloc(0)),
   ]);
 }
+
+// The second disguise seen on a live site (Nov 2026): a 1x1 lossless WebP whose EXIF chunk is
+// the whole TS segment, untouched. Laid out byte for byte like the real ones.
+function disguiseAsWebp(ts) {
+  const chunk = (type, data) => {
+    const head = Buffer.alloc(8);
+    head.write(type, 0, 'latin1');
+    head.writeUInt32LE(data.length, 4);
+    return Buffer.concat([head, data, Buffer.alloc(data.length % 2)]); // RIFF pads to even
+  };
+  const vp8l = Buffer.from('2f000000100710111188 88fe07'.replace(/ /g, ''), 'hex'); // the real 1x1 image
+  const body = Buffer.concat([Buffer.from('WEBP'), chunk('VP8L', vp8l), chunk('EXIF', ts)]);
+  const head = Buffer.alloc(8);
+  head.write('RIFF', 0, 'latin1');
+  head.writeUInt32LE(body.length, 4);
+  return Buffer.concat([head, body]);
+}
+
+// Stands in for the next disguise nobody has decoded yet: a GIF with the TS appended.
+const disguiseAsGif = (ts) => Buffer.concat([Buffer.from('GIF89a'), Buffer.alloc(26), ts]);
+
+const DISGUISES = {
+  png: ['image/png', disguiseAsPng],
+  webp: ['image/webp', disguiseAsWebp],
+  gif: ['image/gif', disguiseAsGif],
+};
 
 export function startServers({ streamDir, hlsJsPath }) {
   const site = http.createServer((req, res) => {
@@ -184,13 +212,13 @@ self.addEventListener('fetch', (e) => {
       res.writeHead(200, { ...headers, 'content-type': 'text/html' });
       return res.end('<html><body><h1>503 Service Unavailable</h1></body></html>');
     }
-    if (['/live/master.m3u8', '/live/png/master.m3u8', '/live/broken/master.m3u8', '/live/rot/master.m3u8', '/live/flaky/master.m3u8'].includes(url.pathname)) {
+    if (/^\/live\/((png|webp|gif|broken|rot|flaky)\/)?master\.m3u8$/.test(url.pathname)) {
       res.writeHead(200, { ...headers, 'content-type': 'application/vnd.apple.mpegurl' });
       return res.end(
         `#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=320x240\nindex.m3u8?token=${TOKEN}\n`
       );
     }
-    const png = url.pathname.startsWith('/live/png/');
+    const disguise = DISGUISES[url.pathname.match(/^\/live\/(\w+)\//)?.[1]];
     const file = path.join(streamDir, path.basename(url.pathname));
     if (!url.pathname.startsWith('/live/') || !fs.existsSync(file)) {
       res.writeHead(404);
@@ -201,9 +229,10 @@ self.addEventListener('fetch', (e) => {
       // Segment URLs need the token too, like real signed CDNs.
       body = body.toString().replace(/^(seg\d+\.ts)$/gm, `$1?token=${TOKEN}`);
     }
-    if (png && !file.endsWith('.m3u8')) {
-      res.writeHead(200, { ...headers, 'content-type': 'image/png' });
-      return res.end(disguiseAsPng(body));
+    if (disguise && !file.endsWith('.m3u8')) {
+      const [type, wrap] = disguise;
+      res.writeHead(200, { ...headers, 'content-type': type });
+      return res.end(wrap(body));
     }
     res.writeHead(200, {
       ...headers,

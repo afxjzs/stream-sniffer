@@ -73,7 +73,7 @@ function unwrapping(stream, callbacks) {
         return callbacks.onError({ code: response.code, text: `not a playlist (no #EXTM3U); server sent ${sent}` }, ctx, details, stats);
       }
       const bytes = response.data instanceof ArrayBuffer ? new Uint8Array(response.data) : null;
-      if (!bytes || !StreamSnifferDisguise.isPng(bytes)) return callbacks.onSuccess(response, stats, ctx, details);
+      if (!bytes || !StreamSnifferDisguise.isDisguised(bytes)) return callbacks.onSuccess(response, stats, ctx, details);
       StreamSnifferDisguise.decodeDisguisedSegment(bytes, browserCodecs).then(
         (ts) => {
           response.data = ts.buffer.slice(ts.byteOffset, ts.byteOffset + ts.byteLength);

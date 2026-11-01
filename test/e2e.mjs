@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { startServers, SITE, EMBED, MASTER_URL, CDN2_MASTER_URL } from './fixtures/server.mjs';
+import { startServers, SITE, EMBED, MASTER_URL, CDN2_MASTER_URL, WEBP_MASTER_URL, GIF_MASTER_URL } from './fixtures/server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const extDir = path.resolve(here, '../extension');
@@ -439,6 +439,43 @@ async function main() {
       tSeg.status === 200 && tBytes[0] === 0x47 && tSeg.headers.get('content-type') === 'video/mp2t',
       `relay hands the TV plain MPEG-TS, not the PNG wrapper (${tSeg.status}, first byte 0x${tBytes[0]?.toString(16)}, ${tSeg.headers.get('content-type')})`
     );
+
+    step('WebP-disguised segments (TS inside a 1x1 WebP\'s EXIF chunk): the player plays them and the relay casts plain MPEG-TS');
+    // A real site did this in Nov 2026; the relay sent the WebP bytes to the TV as video/mp2t
+    // and the TV buffered forever.
+    const webp = await browser.newPage();
+    await webp.goto(`chrome-extension://${ext.id}/player.html`);
+    await webp.type('input[name=url]', WEBP_MASTER_URL);
+    await webp.type('input[name=referer]', EMBED + '/');
+    await webp.click('button::-p-text(Play)');
+    await waitForPlayback(webp, 'extension player on WebP-disguised stream');
+    ok('extension player plays the WebP-disguised stream');
+    await webp.click('button::-p-text(Cast via relay)');
+    const webpFrame = await webp.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
+    const webpMedia = (await waitForText(webpFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
+    const wVariantUrl = new URL(firstUri(await (await fetch(webpMedia)).text()), webpMedia).href;
+    const wSegUrl = new URL(firstUri(await (await fetch(wVariantUrl)).text()), wVariantUrl).href;
+    const wSeg = await fetch(wSegUrl);
+    const wBytes = new Uint8Array(await wSeg.arrayBuffer());
+    const original = fs.readFileSync(path.join(streamDir, 'seg0.ts'));
+    assert(
+      wSeg.status === 200 && wSeg.headers.get('content-type') === 'video/mp2t' && Buffer.from(wBytes).equals(original),
+      `relay hands the TV the original MPEG-TS segment, not the WebP wrapper (${wSeg.status}, ${wBytes.length} bytes, starts ${Buffer.from(wBytes.subarray(0, 4)).toString('hex')}, ${wSeg.headers.get('content-type')})`
+    );
+    await webp.close();
+
+    step('A segment in an image format nobody can decode stops the cast with a reason, instead of reaching the TV as junk');
+    const gif = await browser.newPage();
+    await gif.goto(`chrome-extension://${ext.id}/player.html`);
+    await gif.type('input[name=url]', GIF_MASTER_URL);
+    await gif.type('input[name=referer]', EMBED + '/');
+    await gif.click('button::-p-text(Play)');
+    await gif.click('button::-p-text(Cast via relay)');
+    const gifMsg = await waitForText(gif, /^Relay:.*image/i, 15000);
+    ok(`player reports: "${gifMsg}"`);
+    const gifFrames = gif.frames().filter((f) => f.url().startsWith(`${RELAY}/cast/`));
+    assert(gifFrames.length === 0, 'no cast controls are offered for it');
+    await gif.close();
 
     step('Manual mode: paste URL + Referer into the player page');
     const manual = await browser.newPage();

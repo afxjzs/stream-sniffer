@@ -1,9 +1,11 @@
-// Some stream sites disguise their video segments as PNG images, served from image CDNs.
-// The one format seen so far (Oct 2026) is an ordinary RGB PNG whose decoded pixel bytes are:
+// Some stream sites disguise their video segments as images, served from image CDNs. Two
+// formats seen so far:
 //
-//   "TIKTIKPX"  +  uint32 big-endian length  +  gzip(MPEG-TS segment)
+//   PNG (Oct 2026): an ordinary RGB PNG whose decoded pixel bytes are
+//     "TIKTIKPX"  +  uint32 big-endian length  +  gzip(MPEG-TS segment)
+//   WebP (Nov 2026): a 1x1 lossless WebP whose EXIF chunk is the whole MPEG-TS segment, as is.
 //
-// This decodes that back to MPEG-TS. It's a classic script so the extension player can load it
+// This decodes those back to MPEG-TS. It's a classic script so the extension player can load it
 // with a <script> tag, and the relay (Node) can import it; each passes in its own inflate/gunzip.
 (function () {
   const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
@@ -11,7 +13,34 @@
   const BYTES_PER_PIXEL = { 0: 1, 2: 3, 4: 2, 6: 4 }; // gray, RGB, gray+alpha, RGBA (8-bit)
 
   const isPng = (b) => b.length > 8 && PNG_SIGNATURE.every((v, i) => b[i] === v);
+  const ascii = (b, from, to) => String.fromCharCode(...b.subarray(from, to));
+  const isWebp = (b) => b.length > 12 && ascii(b, 0, 4) === 'RIFF' && ascii(b, 8, 12) === 'WEBP';
+  const isDisguised = (b) => isPng(b) || isWebp(b);
   const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+
+  // Image formats a CDN might wrap a segment in. Something that starts like one of these and
+  // isn't a disguise we decode must not be passed off as video.
+  const IMAGE_SIGNATURES = { PNG: [0x89, 0x50, 0x4e, 0x47], JPEG: [0xff, 0xd8, 0xff], GIF: [0x47, 0x49, 0x46, 0x38], 'RIFF (WebP)': [0x52, 0x49, 0x46, 0x46] };
+  const imageKind = (b) => Object.keys(IMAGE_SIGNATURES).find((k) => IMAGE_SIGNATURES[k].every((v, i) => b[i] === v)) || null;
+
+  // The MPEG-TS stored in a WebP's EXIF chunk.
+  function decodeWebp(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const chunks = [];
+    for (let off = 12; off + 8 <= bytes.length; ) {
+      const type = ascii(bytes, off, off + 4);
+      const len = view.getUint32(off + 4, true);
+      if (off + 8 + len > bytes.length) throw new Error(`image-disguised segment: WebP ${type} chunk runs past the end of the file`);
+      chunks.push(type);
+      if (type === 'EXIF') {
+        const ts = bytes.subarray(off + 8, off + 8 + len);
+        if (ts[0] !== 0x47) throw new Error(`segment is a WebP image, but its EXIF chunk isn't MPEG-TS (starts with ${hex(ts.subarray(0, 4))})`);
+        return ts;
+      }
+      off += 8 + len + (len % 2); // chunks are padded to an even length
+    }
+    throw new Error(`segment is a WebP image with no EXIF chunk, not a disguise format Stream Sniffer knows (chunks: ${chunks.join(', ') || 'none'})`);
+  }
 
   function concat(parts) {
     const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -54,9 +83,10 @@
     return out;
   }
 
-  // Returns the MPEG-TS bytes, null if `bytes` isn't a PNG (nothing to do), or throws if it is a
-  // PNG but not one we can decode, so the caller can show why playback failed.
+  // Returns the MPEG-TS bytes, null if `bytes` isn't a PNG or WebP (nothing to do), or throws if
+  // it is one but not a disguise we can decode, so the caller can show why playback failed.
   async function decodeDisguisedSegment(bytes, { inflate, gunzip }) {
+    if (isWebp(bytes)) return decodeWebp(bytes);
     if (!isPng(bytes)) return null;
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     let width, height, depth, colorType, interlace;
@@ -91,5 +121,5 @@
     return ts;
   }
 
-  globalThis.StreamSnifferDisguise = { isPng, decodeDisguisedSegment };
+  globalThis.StreamSnifferDisguise = { isDisguised, imageKind, decodeDisguisedSegment };
 })();

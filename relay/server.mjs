@@ -126,20 +126,30 @@ async function fetchUpstream(id, stream, upstream) {
   }
   // Some CDNs disguise TS segments as images (see extension/disguise.js). The Chromecast can't
   // decode those the way the site's own player does, so hand it plain MPEG-TS.
-  if (StreamSnifferDisguise.isPng(body)) {
-    let ts;
-    try {
-      ts = await StreamSnifferDisguise.decodeDisguisedSegment(body, nodeCodecs);
-    } catch (err) {
-      const msg = `couldn't decode ${upstream}: ${err.message}`;
-      recordError(id, stream, msg);
-      return { status: 502, error: msg };
-    }
+  let ts;
+  try {
+    ts = await StreamSnifferDisguise.decodeDisguisedSegment(body, nodeCodecs);
+  } catch (err) {
+    const msg = `couldn't decode ${upstream}: ${err.message}`;
+    recordError(id, stream, msg);
+    return { status: 502, error: msg };
+  }
+  if (ts) {
     if (!stream.unwrapNoted) {
       stream.unwrapNoted = true;
       console.log(`[relay] ${id}: segments are disguised as images; decoding them for the TV`);
     }
     return { status: 200, isPlaylist, body: Buffer.from(ts), type: 'video/mp2t' };
+  }
+  // An image we can't unwrap must not reach the TV labeled as video: it would download every
+  // segment, decode none, and buffer forever with no error anywhere.
+  const kind = StreamSnifferDisguise.imageKind(body);
+  const looksLikeTs = body[0] === 0x47 && (body.length <= 188 || body[188] === 0x47);
+  if (!looksLikeTs && (kind || /^image\//i.test(type))) {
+    const what = kind ? `a ${kind} image` : `served as ${type}`;
+    const msg = `${upstream} is ${what}, not video, in a disguise format Stream Sniffer can't decode (starts with ${body.subarray(0, 8).toString('hex')})`;
+    recordError(id, stream, msg);
+    return { status: 502, error: msg };
   }
   const realType = /^image\//i.test(type) ? 'video/mp2t' : type || 'application/octet-stream';
   return { status: 200, isPlaylist, body, type: realType };
@@ -161,6 +171,11 @@ async function probe(id, stream) {
     media = v.raw;
   }
   const firstSeg = media.split(/\r?\n/).find((l) => l.trim() && !l.startsWith('#')) || '';
+  if (!firstSeg) return { error: `${mediaBase} lists no segments` };
+  // A segment the TV can't use (rejected, or wrapped in a format we can't decode) shows up
+  // here, in the player, instead of as endless buffering on the TV.
+  const seg = await fetchUpstream(id, stream, new URL(firstSeg.trim(), mediaBase).href);
+  if (seg.error) return { error: seg.error };
   return {
     info: {
       live: !/#EXT-X-ENDLIST/.test(media),
