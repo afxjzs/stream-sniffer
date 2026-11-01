@@ -49,24 +49,27 @@ To update later, run `git pull`, then click the reload icon (↻) on the extensi
 1. Open the page with the video and press play.
 2. The Stream Sniffer icon shows a badge with the number of playlists it caught on that tab.
    Click the icon.
-3. Each playlist in the popup has these buttons:
-   - **Open in player** plays the stream in a new tab, sending the captured Referer and Origin.
+3. Each playlist in the popup shows its server and file name, with two buttons:
    - **Add to player** adds the stream to the player tab you used last, as a small picture over
      the big one (or replaces the small one). With no player tab open, it opens one.
-   - **Copy VLC command** copies a terminal command that plays the stream in VLC.
-   - **Copy curl** copies a `curl` command that repeats the browser's request with every header.
-     It's useful for testing what a stream server accepts.
+   - **Open in player** plays the stream in a new tab, sending the captured Referer and Origin.
+
+   The **⋯** button shows the full URL, the headers the page sent, and three copy buttons:
    - **Copy URL** copies the playlist address.
+   - **Copy VLC command** copies a terminal command that plays the stream in VLC.
+   - **Copy curl command** copies a `curl` command that repeats the browser's request with every
+     header. It's useful for testing what a stream server accepts.
 4. The player fills the tab with the video. With two streams, the second floats in a corner;
    click it to swap the two pictures. Drag it to move it, or drag a corner to resize it; the
    player remembers where you put it. Click its **×** to remove it. The sound always follows
    the big picture. Each stream
    gets its own Referer and Origin, so the two can come from different sites. Problems
-   (errors, buffering, failed requests the player is retrying) show over the video while they
-   last. Live streams just play: if a video pauses (from its controls, a media key, or Chrome
+   (errors, buffering, failed requests the player is retrying) show as a short line over the
+   video while they last. Live streams just play: if a video pauses (from its controls, a media key, or Chrome
    itself), the player starts it again at once and notes it in the ⚙ menu.
-5. The ⚙ button opens the player menu: where each stream came from, its status, a form to play
-   another URL on the big screen, **Pop out**, and the relay. **Pop out** moves the big video into
+5. The ⚙ button opens the player menu: where each stream came from and its status, **Play a
+   URL…** to play another URL on the big screen, **Pop out**, and the relay. Each stream's
+   **Details** has the full error, the stream URL, and other technical facts. **Pop out** moves the big video into
    a small floating window that stays on top of other apps. Click **Back to tab** (or close the
    floating window) to return it.
 6. To play a URL you already have, click **Open player** at the top of the popup. Then paste the

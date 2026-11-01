@@ -19,13 +19,15 @@
   <button id="settings" type="button" aria-label="Settings" aria-expanded="false" title="Settings">⚙</button>
   <div id="menu" hidden>
     <div id="streams"></div>
-    <form id="form">
-      <p class="muted small">Play a URL on the big screen</p>
-      <label>Stream URL <input name="url" type="url" required placeholder="https://…/index.m3u8"></label>
-      <label>Referer <input name="referer" type="url" placeholder="https://embed-site/ (optional)"></label>
-      <label>Origin <input name="origin" type="url" placeholder="https://embed-site (optional)"></label>
-      <button type="submit">Play</button>
-    </form>
+    <details id="play-url">
+      <summary>Play a URL…</summary>
+      <form id="form">
+        <label>Stream URL <input name="url" type="url" required placeholder="https://…/index.m3u8"></label>
+        <label>Referer <input name="referer" type="url" placeholder="https://embed-site/ (optional)"></label>
+        <label>Origin <input name="origin" type="url" placeholder="https://embed-site (optional)"></label>
+        <button type="submit">Play on the big screen</button>
+      </form>
+    </details>
     <div class="actions">
       <button id="popout" type="button" title="Play in a floating window that stays on top">Pop out</button>
       <button id="relay" type="button" title="Experimental: needs the relay running (node relay/server.mjs)">Cast via relay (beta)</button>

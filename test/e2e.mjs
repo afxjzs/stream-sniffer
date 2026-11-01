@@ -75,13 +75,14 @@ async function waitForPlayback(frameOrPage, label, minSeconds = 1.5, timeoutMs =
   }
 }
 
-// Waits until some leaf element's text matches the regex; returns that text.
+// Waits until some visible leaf element's text matches the regex; returns that text. Text in a
+// closed menu or a collapsed section doesn't count: the user can't see it.
 async function waitForText(page, re, timeoutMs = 10000) {
   const handle = await page.waitForFunction(
     (src, flags) => {
       const rx = new RegExp(src, flags);
       const el = [...document.querySelectorAll('body *')].find(
-        (e) => e.children.length === 0 && rx.test(e.textContent)
+        (e) => e.children.length === 0 && rx.test(e.textContent) && e.checkVisibility()
       );
       return el ? el.textContent : false;
     },
@@ -176,8 +177,29 @@ async function main() {
     ok('popup lists master.m3u8');
     await popup.screenshot({ path: path.join(artifactsDir, 'popup.png') });
 
-    step('The VLC command shown in the popup carries headers the CDN accepts');
-    const vlcCmd = await popup.$eval('::-p-text(--http-referrer)', (el) => el.textContent);
+    let masterItem = null;
+    for (const li of await popup.$$('li')) {
+      if ((await li.evaluate((el) => el.textContent)).includes('live/master.m3u8')) masterItem = li;
+    }
+    assert(masterItem, 'popup has a list entry for master.m3u8');
+    const popupText = await popup.$eval('body', (b) => b.innerText);
+    assert(
+      !popupText.includes('http-referrer') && !popupText.includes(MASTER_URL),
+      'the popup leads with the player buttons; commands and full URLs stay tucked away'
+    );
+
+    step('The VLC command the popup copies carries headers the CDN accepts');
+    // The clipboard is the outside world here: record what the popup copies instead.
+    await popup.evaluate(() => {
+      window.copied = [];
+      navigator.clipboard.writeText = async (text) => void window.copied.push(text);
+    });
+    const copyFromMaster = async (label) => {
+      await (await masterItem.$(`button::-p-text(${label})`)).click();
+      return popup.evaluate(() => window.copied.at(-1));
+    };
+    await (await masterItem.$('::-p-aria(More)')).click();
+    const vlcCmd = await copyFromMaster('Copy VLC command');
     console.log(`  command: ${vlcCmd}`);
     const referrer = vlcCmd.match(/--http-referrer='([^']+)'/)?.[1];
     const cmdUrl = vlcCmd.match(/'(https?:\/\/[^']*master\.m3u8[^']*)'/)?.[1];
@@ -185,9 +207,9 @@ async function main() {
     const viaCmd = await fetch(cmdUrl, { headers: { referer: referrer } });
     assert(viaCmd.status === 200, `fetching with the command's referrer -> 200 (got ${viaCmd.status})`);
 
-    step('The curl command shown in the popup replays the browser request exactly');
-    const curlCmd = await popup.$eval('::-p-text(curl )', (el) => el.textContent);
-    assert(curlCmd.includes('master.m3u8'), 'popup shows a curl command for the master playlist');
+    step('The curl command the popup copies replays the browser request exactly');
+    const curlCmd = await copyFromMaster('Copy curl command');
+    assert(curlCmd?.startsWith('curl ') && curlCmd.includes('master.m3u8'), 'popup copies a curl command for the master playlist');
     // Async on purpose: the fake CDN lives in this process, so a blocking spawnSync would deadlock.
     const curlRun = await new Promise((resolve) =>
       execFile('sh', ['-c', `${curlCmd} -o /dev/null -w '%{http_code}'`], { timeout: 10000 }, (err, stdout, stderr) =>
@@ -200,11 +222,6 @@ async function main() {
     );
 
     step('"Open in player" plays the stream in the extension player');
-    let masterItem = null;
-    for (const li of await popup.$$('li')) {
-      if ((await li.evaluate((el) => el.textContent)).includes('master.m3u8')) masterItem = li;
-    }
-    assert(masterItem, 'popup has a list entry for master.m3u8');
     const playerTargetP = browser.waitForTarget((t) => t.url().includes('/player.html'), {
       timeout: 5000,
     });
@@ -215,12 +232,14 @@ async function main() {
     await player.bringToFront();
     const playerTime = await waitForPlayback(player, 'extension player');
     ok(`extension player is playing (t=${playerTime.toFixed(1)}s)`);
+    await player.click('::-p-aria(Settings)');
     const sourceText = await waitForText(player, /Fake Sports Site/, 5000);
     assert(
       (await player.$eval('a[href]', (a) => a.href).catch(() => '')) === SITE + '/',
       `player shows where the stream came from ("${sourceText}", linked to ${SITE}/)`
     );
     assert((await player.title()).includes('Fake Sports Site'), `player tab title names the source page ("${await player.title()}")`);
+    await player.click('::-p-aria(Settings)'); // close the menu
     await player.screenshot({ path: path.join(artifactsDir, 'player-from-popup.png') });
 
     step('The video fills the tab; the controls sit behind a settings button');
@@ -230,8 +249,8 @@ async function main() {
     });
     assert(fills, 'video covers the whole tab');
     await player.click('::-p-aria(Settings)');
-    await player.waitForSelector('input[name=url]', { visible: true, timeout: 5000 });
-    ok('settings menu shows the stream form');
+    await player.waitForSelector('button::-p-text(Pop out)', { visible: true, timeout: 5000 });
+    ok('the settings button opens the menu');
 
     step('"Pop out" puts the video in a floating picture-in-picture window, and can bring it back');
     await player.click('button::-p-text(Pop out)');
@@ -252,7 +271,7 @@ async function main() {
     await ext.triggerAction(second);
     const popup3Target = await popup3P;
     const popup3 = await popup3Target.asPage();
-    await popup3.waitForSelector(`::-p-text(${CDN2_MASTER_URL})`, { timeout: 5000 });
+    await popup3.waitForSelector(`::-p-text(${new URL(CDN2_MASTER_URL).host})`, { timeout: 5000 });
     await popup3.click('button::-p-text(Add to player)');
     const sizes = () =>
       player.$$eval('video', (vs) =>
@@ -437,8 +456,18 @@ async function main() {
     await garbled.type('input[name=referer]', EMBED + '/');
     await garbled.click('button::-p-text(Play)');
     // A garbled reply is retried like a failed load, so this takes a few seconds.
-    const garbledMsg = await waitForText(garbled, /Playback failed.*EXTM3U.*503 Service Unavailable/, 30000);
-    ok(`player reports: "${garbledMsg}"`);
+    await garbled.waitForFunction(() => /Stopped/.test(document.getElementById('problems').textContent), {
+      timeout: 30000,
+      polling: 250,
+    });
+    const garbledShort = await garbled.$eval('#problems', (p) => p.textContent);
+    assert(
+      garbledShort.length < 120 && !/Buffering|Reconnecting/.test(garbledShort),
+      `over the video, one short line says it stopped ("${garbledShort}")`
+    );
+    await garbled.click('summary::-p-text(Details)');
+    const garbledMsg = await waitForText(garbled, /EXTM3U.*503 Service Unavailable/);
+    ok(`the stream's details in the menu say what the server sent: "${garbledMsg}"`);
 
     step('A live stream whose segment URLs change on every refresh keeps playing, and the player says what it skipped');
     const rot = await browser.newPage();
@@ -450,8 +479,9 @@ async function main() {
     // The first playlist holds 6 s; playing 9 s more needs refreshes with the new URLs.
     const rotEnd = await waitForPlayback(rot, 'rotating live stream after refreshes', rotStart + 9, 30000);
     ok(`kept playing across refreshes (${rotStart.toFixed(1)}s -> ${rotEnd.toFixed(1)}s)`);
+    await rot.click('summary::-p-text(Details)');
     const rotNote = await waitForText(rot, /skipped \d+ playlist problems?.*media sequence mismatch/);
-    ok(`stream status says: "${rotNote.slice(0, 160)}…"`);
+    ok(`the stream's details say: "${rotNote.slice(0, 160)}…"`);
 
     step('A playlist refresh that fails once shows while it is retried, then clears; a pause is undone');
     const flaky = await browser.newPage();
@@ -479,6 +509,7 @@ async function main() {
     const pausedT = await flaky.evaluate(() => document.querySelector('video').currentTime);
     await waitForPlayback(flaky, 'flaky live stream after a pause', pausedT + 1, 5000);
     await flaky.click('::-p-aria(Settings)');
+    await flaky.click('summary::-p-text(Details)');
     const resumeNote = await waitForText(flaky, /resumed after 1 pause/i);
     ok(`a pause is undone at once and noted in the status: "${resumeNote.slice(0, 160)}"`);
     await flaky.close();

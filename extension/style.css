@@ -22,13 +22,21 @@ button {
 button:hover { border-color: var(--accent); }
 button.link { background: none; border: none; color: var(--accent); padding: 0; }
 
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover { filter: brightness(1.1); }
+
 /* popup */
-body.popup { width: 480px; padding: 12px; }
+body.popup { width: 380px; padding: 12px; }
 .popup header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.popup #status { margin: 0 0 8px; }
+.popup #status:empty { display: none; }
 .popup ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
-.popup li { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px; display: grid; gap: 6px; }
+.popup li { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px; display: grid; gap: 8px; }
+.popup .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .popup .actions { display: flex; gap: 6px; flex-wrap: wrap; }
-.popup .cmd { color: var(--muted); max-height: 4.2em; overflow: auto; }
+.popup button.icon { margin-left: auto; padding: 4px 8px; }
+.popup .more { display: grid; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); }
+.popup .more[hidden] { display: none; }
 
 /* player: the big video fills the tab; everything else floats over it */
 body.player { background: #000; overflow: hidden; }
@@ -63,10 +71,13 @@ body.player { background: #000; overflow: hidden; }
 .player .stream { display: grid; gap: 2px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
 .player .stream h2 { font-size: 11px; margin: 0; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
 .player .stream a { color: var(--accent); overflow-wrap: anywhere; }
-.player form { display: grid; gap: 8px; }
+.player summary { cursor: pointer; }
+.player .stream details p { margin: 4px 0 0; overflow-wrap: anywhere; }
+.player form { display: grid; gap: 8px; margin-top: 8px; }
 .player label { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }
 .player input { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; }
 .player form button { justify-self: start; }
 .player .actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .player #cast-status:empty { display: none; }
 .player #cast-frame { width: 100%; height: 0; display: block; border: 1px solid var(--border); border-radius: 8px; }
+.player #cast-frame[hidden] { display: none; }

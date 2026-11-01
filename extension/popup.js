@@ -51,11 +51,24 @@ async function addToPlayer(c) {
   await chrome.windows.update(target.windowId, { focused: true });
 }
 
-function button(label, onClick) {
+function button(label, onClick, className = '') {
   const b = document.createElement('button');
   b.textContent = label;
+  b.className = className;
   b.addEventListener('click', onClick);
   return b;
+}
+
+// "host · last/two" is enough to tell a page's playlists apart; the full URL is under ⋯.
+function shortName(url) {
+  const u = new URL(url);
+  return `${u.host} · ${u.pathname.split('/').filter(Boolean).slice(-2).join('/')}`;
+}
+
+function showError(what, err) {
+  console.error(`[stream-sniffer] ${what} failed`, err);
+  statusEl.textContent = `Error ${what}: ${err.message}`;
+  statusEl.className = 'error';
 }
 
 async function copy(btn, text) {
@@ -82,56 +95,58 @@ function render(captures) {
     statusEl.textContent = 'No .m3u8 streams seen on this tab yet. Start playback on the page; this list updates live.';
     return;
   }
-  statusEl.textContent = `${captures.length} stream${captures.length > 1 ? 's' : ''} seen. The first is usually the master playlist.`;
+  if (statusEl.className !== 'error') statusEl.textContent = '';
   for (let i = listEl.children.length; i < captures.length; i++) listEl.append(streamItem(i));
 }
 
+// Each stream: its short name and the two buttons used nearly every time. ⋯ shows the full URL,
+// the headers, and the copy buttons.
 function streamItem(i) {
   const c = current[i];
   const latest = () => current[i];
   const li = document.createElement('li');
 
-  const url = document.createElement('code');
-  url.className = 'url';
-  url.textContent = c.url;
+  const name = document.createElement('div');
+  name.className = 'name';
+  name.textContent = shortName(c.url);
+  name.title = c.url;
 
+  const more = document.createElement('div');
+  more.className = 'more';
+  more.hidden = true;
+  const url = document.createElement('code');
+  url.textContent = c.url;
   const meta = document.createElement('div');
   meta.className = 'muted small';
   meta.textContent = c.referer ? `Referer: ${c.referer}` : 'No Referer was sent';
   if (c.origin) meta.textContent += ` · Origin: ${c.origin}`;
-  if (c.viaServiceWorker) meta.textContent += ' · fetched by the page\'s service worker';
+  if (c.viaServiceWorker) meta.textContent += " · fetched by the page's service worker";
+  const copies = document.createElement('div');
+  copies.className = 'actions';
+  copies.append(
+    button('Copy URL', (e) => copy(e.currentTarget, latest().url)),
+    button('Copy VLC command', (e) => copy(e.currentTarget, vlcCommand(latest()))),
+    button('Copy curl command', (e) => copy(e.currentTarget, curlCommand(latest())))
+  );
+  more.append(url, meta, copies);
 
-  const cmdEl = document.createElement('code');
-  cmdEl.className = 'cmd';
-  cmdEl.textContent = vlcCommand(c);
-
-  const curlEl = document.createElement('code');
-  curlEl.className = 'cmd';
-  curlEl.textContent = curlCommand(c);
+  const moreBtn = button('⋯', () => {
+    more.hidden = !more.hidden;
+    moreBtn.setAttribute('aria-expanded', String(!more.hidden));
+  }, 'icon');
+  moreBtn.setAttribute('aria-label', 'More');
+  moreBtn.setAttribute('aria-expanded', 'false');
+  moreBtn.title = 'Full URL, headers, and copy buttons';
 
   const actions = document.createElement('div');
   actions.className = 'actions';
   actions.append(
-    button('Open in player', () =>
-      openPlayer(latest()).catch((err) => {
-        console.error('[stream-sniffer] open player failed', err);
-        statusEl.textContent = `Error opening player: ${err.message}`;
-        statusEl.className = 'error';
-      })
-    ),
-    button('Add to player', () =>
-      addToPlayer(latest()).catch((err) => {
-        console.error('[stream-sniffer] add to player failed', err);
-        statusEl.textContent = `Error adding to player: ${err.message}`;
-        statusEl.className = 'error';
-      })
-    ),
-    button('Copy VLC command', (e) => copy(e.currentTarget, vlcCommand(latest()))),
-    button('Copy curl', (e) => copy(e.currentTarget, curlCommand(latest()))),
-    button('Copy URL', (e) => copy(e.currentTarget, latest().url))
+    button('Add to player', () => addToPlayer(latest()).catch((err) => showError('adding to player', err)), 'primary'),
+    button('Open in player', () => openPlayer(latest()).catch((err) => showError('opening player', err))),
+    moreBtn
   );
 
-  li.append(url, meta, actions, cmdEl, curlEl);
+  li.append(name, actions, more);
   return li;
 }
 

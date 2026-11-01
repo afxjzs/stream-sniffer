@@ -77,10 +77,7 @@ function unwrapping(stream, callbacks) {
       StreamSnifferDisguise.decodeDisguisedSegment(bytes, browserCodecs).then(
         (ts) => {
           response.data = ts.buffer.slice(ts.byteOffset, ts.byteOffset + ts.byteLength);
-          if (stream.unwrapped++ === 0) {
-            stream.status += ' · segments are disguised as images; decoding them';
-            render();
-          }
+          if (stream.unwrapped++ === 0) render(); // noted in the stream's details
           callbacks.onSuccess(response, stats, ctx, details);
         },
         (err) => {
@@ -118,9 +115,11 @@ function hlsLogger(stream) {
   };
 }
 
-function fail(stream, msg) {
+// msg goes in the stream's details in the menu; short (if different) goes over the video.
+function fail(stream, msg, short = msg) {
   console.error('[stream-sniffer]', msg);
   stream.error = msg;
+  stream.errorShort = short;
   render();
 }
 
@@ -143,8 +142,12 @@ async function startStream(source, slot) {
     hosts: new Set(),
     status: 'Loading…',
     error: '',
+    errorShort: '',
+    mode: '', // how its headers are sent, from background.js
+    levels: 0,
     bufferingSince: null,
     lastProblem: '',
+    lastProblemShort: '',
     problemKind: null, // 'playlist' or 'segment': a later load of that kind ends lastProblem
     resumes: 0, // pauses undone (see the 'pause' listener)
     lastResume: '',
@@ -171,7 +174,7 @@ async function startStream(source, slot) {
   });
   if (!streams.includes(stream)) return; // replaced while we waited
   if (!res?.ok) return fail(stream, `Could not set up request headers: ${res?.error ?? 'no response from background'}`);
-  stream.status = `Loading… (${res.mode})`;
+  stream.mode = res.mode;
   render();
 
   const hls = (stream.hls = new Hls({
@@ -185,13 +188,17 @@ async function startStream(source, slot) {
     const detail = `${data.type} / ${data.details}${why}${code ? ` — HTTP ${code}` : ''}${data.url ? ` — ${data.url}` : ''}${serverSent(data)}`;
     if (data.fatal) {
       stream.status = 'Stopped';
+      stream.lastProblem = stream.lastProblemShort = ''; // nothing is being retried any more
       // Keep a more specific message (e.g. from allowHost) if one is already showing.
-      fail(stream, stream.error || `Playback failed: ${detail}`);
+      if (stream.error) fail(stream, stream.error, stream.errorShort);
+      else fail(stream, `Playback failed: ${detail}`, `Stopped: ${shortReason(data)}`);
     } else {
       // hls.js retries these itself, but a stall with no explanation looks like a frozen
       // picture; show the latest one until playback is healthy again.
       console.warn('[stream-sniffer] non-fatal hls.js error:', detail);
       stream.lastProblem = `${new Date().toLocaleTimeString()}: ${detail} (retrying)`;
+      // A stalled buffer already shows as "Buffering…"; failed loads say what's being retried.
+      stream.lastProblemShort = data.type === Hls.ErrorTypes.NETWORK_ERROR ? `Reconnecting… (${shortReason(data)})` : '';
       stream.problemKind = /^(frag|key)Load/.test(data.details)
         ? 'segment'
         : /^(manifest|level|audioTrack|subtitleTrack)Load/.test(data.details)
@@ -203,7 +210,7 @@ async function startStream(source, slot) {
   // A retried load that then works ends the problem it showed.
   const recovered = (kind) => () => {
     if (stream.problemKind !== kind) return;
-    stream.lastProblem = '';
+    stream.lastProblem = stream.lastProblemShort = '';
     stream.problemKind = null;
     render();
   };
@@ -212,13 +219,21 @@ async function startStream(source, slot) {
     hls.on(e, recovered('playlist'));
   }
   hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
-    const n = data.levels.length;
-    stream.status = `Playing · ${n} quality level${n === 1 ? '' : 's'} · ${res.mode}${stream.unwrapped ? ' · segments are disguised as images; decoding them' : ''}`;
+    stream.levels = data.levels.length;
+    stream.status = 'Playing';
     render();
     startPlayback(stream);
   });
   hls.loadSource(source.url);
   hls.attachMedia(video);
+}
+
+// A few words on why a load failed, for the line over the video.
+function shortReason(data) {
+  if (data.response?.text?.startsWith('not a playlist')) return "the server sent something that isn't a stream";
+  if (data.response?.code) return `server answered HTTP ${data.response.code}`;
+  if (/TimeOut$/.test(data.details)) return 'the server took too long';
+  return data.details;
 }
 
 // For a playlist hls.js couldn't parse: its reason ("no EXTM3U delimiter", "media sequence
@@ -411,7 +426,7 @@ for (const v of videos) {
     const s = streamOf(v);
     if (!s) return;
     s.bufferingSince = null;
-    s.lastProblem = '';
+    s.lastProblem = s.lastProblemShort = '';
     s.problemKind = null;
     render();
   });
@@ -453,21 +468,39 @@ navigator.mediaSession.setActionHandler('play', () => {
   }
 });
 
+// The short line over the video while a stream struggles; the full story is in its details.
 function health(s) {
-  const parts = [];
-  if (s.bufferingSince) parts.push(`Buffering since ${s.bufferingSince}, waiting for video data`);
-  if (s.lastProblem) parts.push(`Last problem ${s.lastProblem}`);
-  if (s.bufferingSince && s.lastSkipped) parts.push(`Last skipped playlist problem ${s.lastSkipped}`);
-  return parts.join(' · ');
+  if (s.error) return ''; // a failed stream isn't buffering or retrying; its error line says why
+  if (s.lastProblemShort) return s.lastProblemShort;
+  return s.bufferingSince ? 'Buffering…' : '';
+}
+
+// The technical facts about a stream, in a collapsed Details section in the menu.
+function streamDetails(s) {
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  return [
+    s.error && `Error: ${s.error}`,
+    s.lastProblem && `Last problem ${s.lastProblem}`,
+    !s.error && s.bufferingSince && `Buffering since ${s.bufferingSince}, waiting for video data`,
+    !s.error && s.bufferingSince && s.lastSkipped && `Last skipped playlist problem ${s.lastSkipped}`,
+    s.mode && `Headers: ${s.mode}`,
+    s.levels && plural(s.levels, 'quality level'),
+    s.unwrapped && 'Segments are disguised as images; decoding them',
+    s.skipped && `hls.js skipped ${plural(s.skipped, 'playlist problem')} (last ${s.lastSkipped})`,
+    s.resumes && `Resumed after ${plural(s.resumes, 'pause')} (last ${s.lastResume})`,
+    ignoredPauses && `Ignored ${plural(ignoredPauses, 'pause request')} from Chrome's media controls (last ${lastIgnoredPause})`,
+    `Stream URL: ${s.source.url}`,
+  ].filter(Boolean);
 }
 
 let renderedEntries = '';
+const openDetails = new Set(); // ids of streams whose Details section is open
 function render() {
   const label = (s) => (streams.length > 1 ? (s === big() ? 'Big: ' : 'Small: ') : '');
   const lines = [];
   if (pageError) lines.push(['error', pageError]);
   for (const s of streams) {
-    if (s.error) lines.push(['error', label(s) + s.error]);
+    if (s.error) lines.push(['error', `${label(s)}${s.errorShort} (details in ⚙)`]);
     if (health(s)) lines.push(['warn', label(s) + health(s)]);
   }
   problemsEl.replaceChildren(
@@ -481,18 +514,12 @@ function render() {
 
   // Rebuilt only when its text changes, so a link isn't swapped out from under a click.
   const entries = streams.map((s, i) => ({
-    heading: streams.length > 1 ? (i === 0 ? 'Big screen' : 'Small screen (click it to swap)') : 'Now playing',
+    id: s.id,
+    heading: streams.length > 1 ? (i === 0 ? 'Big screen' : 'Small screen') : 'Now playing',
     pageUrl: s.source.pageUrl,
     pageTitle: s.source.pageTitle,
-    status: [
-      s.status,
-      s.skipped && `hls.js skipped ${s.skipped} playlist problem${s.skipped === 1 ? '' : 's'} (last ${s.lastSkipped})`,
-      s.resumes && `resumed after ${s.resumes} pause${s.resumes === 1 ? '' : 's'} (last ${s.lastResume})`,
-      ignoredPauses && `ignored ${ignoredPauses} pause request${ignoredPauses === 1 ? '' : 's'} from Chrome's media controls (last ${lastIgnoredPause})`,
-    ]
-      .filter(Boolean)
-      .join(' · '),
-    url: s.source.url,
+    status: s.status,
+    details: streamDetails(s),
   }));
   if (JSON.stringify(entries) !== renderedEntries) {
     renderedEntries = JSON.stringify(entries);
@@ -503,7 +530,7 @@ function render() {
   document.title = b?.pageUrl ? `▶ ${b.pageTitle || b.pageUrl}` : 'Stream Sniffer Player';
 }
 
-// Shows which page a stream came from, its status, and its URL.
+// Shows which page a stream came from and its status, with the rest under Details.
 function streamEntry(e) {
   const el = document.createElement('div');
   el.className = 'stream';
@@ -517,16 +544,30 @@ function streamEntry(e) {
     a.target = '_blank';
     a.rel = 'noopener';
     a.href = e.pageUrl;
-    a.textContent = e.pageTitle ? `${e.pageTitle} (${e.pageUrl})` : e.pageUrl;
+    a.textContent = e.pageTitle || e.pageUrl;
+    a.title = e.pageUrl;
     p.append('From ', a);
     el.append(p);
   }
   const status = document.createElement('p');
   status.className = 'muted small';
   status.textContent = e.status;
-  const url = document.createElement('code');
-  url.textContent = e.url;
-  el.append(status, url);
+  const details = document.createElement('details');
+  details.open = openDetails.has(e.id);
+  details.addEventListener('toggle', () => (details.open ? openDetails.add(e.id) : openDetails.delete(e.id)));
+  const summary = document.createElement('summary');
+  summary.className = 'muted small';
+  summary.textContent = 'Details';
+  details.append(
+    summary,
+    ...e.details.map((line) => {
+      const p = document.createElement('p');
+      p.className = 'small';
+      p.textContent = line;
+      return p;
+    })
+  );
+  el.append(status, details);
   return el;
 }
 
@@ -763,10 +804,14 @@ async function init() {
   if (!sources.length && params.get('url')) {
     sources.push(await saveSource({ url: params.get('url'), referer: params.get('referer') || '', origin: params.get('origin') || '' }));
   }
-  if (!sources.length) return openMenu(true);
+  if (!sources.length) {
+    document.getElementById('play-url').open = true;
+    return openMenu(true);
+  }
   for (const [i, source] of sources.entries()) await startStream(source, i);
 }
 init().catch((err) => {
+  document.getElementById('play-url').open = true;
   openMenu(true);
   failPage(err.message);
 });
