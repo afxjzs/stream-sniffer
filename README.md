@@ -62,16 +62,16 @@ To update later, run `git pull`, then click the reload icon (↻) on the extensi
 4. The player fills the tab with the video. With two streams, the second floats in a corner;
    click it to swap the two pictures. Drag it to move it, or drag a corner to resize it; the
    player remembers where you put it. Click its **×** to remove it. The sound always follows
-   the big picture. Each stream
-   gets its own Referer and Origin, so the two can come from different sites. Problems
-   (errors, buffering, failed requests the player is retrying) show as a short line over the
-   video while they last. Live streams just play: if a video pauses (from its controls, a media key, or Chrome
-   itself), the player starts it again at once and notes it in the ⚙ menu.
+   the big picture. Each stream gets its own Referer and Origin, so the two can come from
+   different sites. Problems (errors, buffering, failed requests the player is retrying) show as
+   a short line over the video while they last. Live streams just play: if a video pauses (from
+   its controls, a media key, or Chrome itself), the player starts it again at once and notes it
+   in the ⚙ menu.
 5. The ⚙ button opens the player menu: where each stream came from and its status, **Play a
    URL…** to play another URL on the big screen, **Pop out**, and the relay. Each stream's
-   **Details** has the full error, the stream URL, and other technical facts. **Pop out** moves the big video into
-   a small floating window that stays on top of other apps. Click **Back to tab** (or close the
-   floating window) to return it.
+   **Details** has the full error, the stream URL, and other technical facts. **Pop out** moves
+   the big video into a small floating window that stays on top of other apps. Click **Back to
+   tab** (or close the floating window) to return it.
 6. To play a URL you already have, click **Open player** at the top of the popup. Then paste the
    stream URL, plus a Referer if the server needs one.
 
@@ -86,8 +86,9 @@ installed, so reload a page that was already open.
 The relay sends a stream to a Chromecast as real video, so the TV plays it at full quality and
 your computer doesn't re-encode a tab.
 
-It's experimental. It plays some streams smoothly. On others the TV keeps buffering, and the cause
-isn't known yet.
+It's experimental. One cause of endless buffering on the TV is fixed: segments disguised in an
+image format the relay didn't decode. The relay now stops with an error for those instead. If the
+TV still keeps buffering on a stream, the cause isn't known yet.
 
 ### Why it's needed
 
@@ -173,7 +174,8 @@ The player shows the relay address in its status messages, so you can confirm wh
 | "Relay: not running at http://localhost:8788" | Start the relay with `node relay/server.mjs`. |
 | The relay exits with "is not reaching this relay" | Another program is using the port. Pick another with `RELAY_PORT` and update `relayUrl` (see [Settings](#settings)). |
 | The cast controls say Google Cast is unavailable | Use Google Chrome, and check that an ad or script blocker isn't blocking `gstatic.com`. |
-| The TV keeps buffering | Known beta issue for some streams. Check "Relay activity" for errors, or [open an issue](https://github.com/afxjzs/stream-sniffer/issues) with what it shows. |
+| "Relay: … is a … image, not video, in a disguise format Stream Sniffer can't decode" | The site hides its video in a new kind of image. [Open an issue](https://github.com/afxjzs/stream-sniffer/issues) with the full message; the bytes it shows help work out the format. |
+| The TV keeps buffering | Check "Relay activity" for errors. If there are none, it's the known beta issue: [open an issue](https://github.com/afxjzs/stream-sniffer/issues) with what Relay activity shows. |
 
 ## How it works
 
@@ -196,9 +198,10 @@ The player shows the relay address in its status messages, so you can confirm wh
   `extension/vendor/` because Manifest V3 extensions can't load remote code.
 - **Cast page.** The relay serves the cast page from `http://localhost`, because extension pages
   can't load Google's Cast SDK. The player embeds it in a frame.
-- **Errors.** Failures appear on screen. The player shows the hls.js error and HTTP status. The
-  relay checks a stream through the player tab before casting, so a rejected stream shows an error
-  instead of a black TV.
+- **Errors.** Failures appear on screen. The player shows a short line over the video, and the
+  full hls.js error and HTTP status in the stream's Details. Before casting, the relay fetches
+  the stream's playlists and first segment through the player tab, so a rejected stream or a
+  segment the TV can't play shows an error instead of a black or buffering TV.
 
 ## Project layout
 
