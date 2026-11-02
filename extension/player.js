@@ -635,7 +635,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // Cast via the relay. Some stream servers only answer Chrome itself, so this tab does all the
 // fetching: it long-polls the relay for URLs the TV wants, fetches them here (where the
 // Referer/Origin rewrite applies), and posts the bytes back. The relay serves them to the TV.
-// That's why this tab has to stay open while casting. It casts the big picture's stream.
+// That's why this tab has to stay open while casting. With one stream it casts that; with two,
+// the relay makes them one channel for the TV, and the cast controls' Swap on TV switches it.
 // Where the relay listens. Override with chrome.storage.local.relayUrl (the E2E test uses this
 // to run its own relay next to yours); the active address shows in every relay message.
 const DEFAULT_RELAY = 'http://localhost:8788';
@@ -650,8 +651,9 @@ const relayBtn = document.getElementById('relay');
 const setRelay = (msg) => (castStatus.textContent = `Relay: ${msg}`);
 let bridge = null;
 
-function startBridge(id, stream) {
-  const b = { id, stream, stopped: false, served: 0 };
+// cast: the streams being cast, in the order the relay knows them (a job's src indexes this).
+function startBridge(id, cast) {
+  const b = { id, cast, stopped: false, served: 0 };
   b.fail = (msg) => {
     if (b.stopped) return;
     b.stopped = true;
@@ -686,7 +688,9 @@ async function runJob(b, job) {
   let headers;
   let body;
   try {
-    await allowHost(b.stream, job.url);
+    const stream = b.cast[job.src ?? 0];
+    if (!stream) throw new Error(`the relay asked for stream ${job.src + 1}, but this tab is casting ${b.cast.length}`);
+    await allowHost(stream, job.url);
     const up = await fetch(job.url, { cache: 'no-store' });
     body = await up.arrayBuffer();
     headers = {
@@ -718,13 +722,19 @@ relayBtn.addEventListener('click', async () => {
     return;
   }
   await relayReady;
-  setRelay(`registering stream with the relay at ${RELAY}…`);
+  // Two streams in the player: cast both as one channel, big one first, so the TV can swap.
+  const cast = streams.slice(0, 2);
+  setRelay(
+    cast.length > 1
+      ? `registering both streams with the relay at ${RELAY}, for Swap on TV…`
+      : `registering stream with the relay at ${RELAY}…`
+  );
   let res;
   try {
     res = await fetch(`${RELAY}/api/streams`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ url: s.source.url }),
+      body: JSON.stringify({ sources: cast.map((x) => ({ url: x.source.url, label: castLabel(x) })) }),
     });
   } catch (err) {
     console.error('[stream-sniffer] relay unreachable', err);
@@ -738,8 +748,8 @@ relayBtn.addEventListener('click', async () => {
   }
 
   if (bridge) bridge.stopped = true;
-  const b = (bridge = startBridge(reg.id, s));
-  setRelay('checking the stream through this tab…');
+  const b = (bridge = startBridge(reg.id, cast));
+  setRelay(cast.length > 1 ? 'checking both streams through this tab…' : 'checking the stream through this tab…');
   const probeRes = await fetch(`${RELAY}/api/streams/${reg.id}/probe`, { method: 'POST' });
   const info = await probeRes.json().catch((err) => ({ error: `relay sent a non-JSON reply (HTTP ${probeRes.status}): ${err.message}` }));
   if (!probeRes.ok || info.error) {
@@ -749,23 +759,36 @@ relayBtn.addEventListener('click', async () => {
   }
   b.info = info;
 
-  // The TV takes over; stop playing here so the stream isn't downloaded twice.
-  if (s.hls) {
-    s.hls.destroy();
-    s.hls = null;
-    s.video.removeAttribute('src');
-    s.video.load();
-    s.casting = true; // an empty player box while the TV plays is just dead space
-    layout();
-    s.status = 'Stopped here while casting. Press Play to watch on this computer again.';
-    render();
+  // The TV takes over; stop playing here so nothing is downloaded twice. With a channel that
+  // means both streams: the TV has them both, one at a time.
+  for (const x of cast) {
+    if (!x.hls) continue;
+    x.hls.destroy();
+    x.hls = null;
+    x.video.removeAttribute('src');
+    x.video.load();
+    x.casting = true; // an empty player box while the TV plays is just dead space
+    x.status = 'Stopped here while casting. Press Play to watch on this computer again.';
   }
+  layout();
+  render();
   const frame = document.getElementById('cast-frame');
   frame.src = `${info.castPageUrl}?embed=1`;
   frame.hidden = false;
   frame.style.height = '300px'; // until the cast page reports its real height
-  setRelay('ready — click "Cast to TV" below. Keep this tab open; it fetches the stream for the TV.');
+  setRelay(
+    cast.length > 1
+      ? `ready — click "Cast to TV" below, then "Swap on TV" to switch between ${cast.map(castLabel).join(' and ')}. Keep this tab open; it fetches both streams for the TV.`
+      : 'ready — click "Cast to TV" below. Keep this tab open; it fetches the stream for the TV.'
+  );
 });
+
+// What the cast controls call a stream: its page's title and the end of its URL, since two
+// streams from one page share a title.
+function castLabel(s) {
+  const path = new URL(s.source.url).pathname.split('/').filter(Boolean).slice(-2).join('/');
+  return s.source.pageTitle ? `${s.source.pageTitle} · ${path}` : `${new URL(s.source.url).host} · ${path}`;
+}
 
 // The cast page reports its content height; grow the frame to match so it never scrolls.
 window.addEventListener('message', (e) => {

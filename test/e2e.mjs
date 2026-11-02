@@ -6,6 +6,7 @@
 // Artifacts (screenshots) land in test/artifacts/.
 import puppeteer from 'puppeteer';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +15,7 @@ import { startServers, SITE, EMBED, MASTER_URL, CDN2_MASTER_URL, WEBP_MASTER_URL
 const here = path.dirname(fileURLToPath(import.meta.url));
 const extDir = path.resolve(here, '../extension');
 const streamDir = path.join(here, 'fixtures/stream');
+const streamDirB = path.join(here, 'fixtures/stream-b');
 const artifactsDir = path.join(here, 'artifacts');
 const relayPath = path.resolve(here, '../relay/server.mjs');
 // Not 8788, so the test can run while your own relay is up.
@@ -32,22 +34,28 @@ function assert(cond, msg) {
   ok(msg);
 }
 
-function ensureStream() {
-  if (fs.existsSync(path.join(streamDir, 'index.m3u8'))) return;
-  step('Generating test HLS stream with ffmpeg');
-  fs.mkdirSync(streamDir, { recursive: true });
+// Two streams with different pictures, so a test can tell which one reached the TV.
+function ensureStreams() {
+  ensureStream(streamDir, 'testsrc', 440);
+  ensureStream(streamDirB, 'testsrc2', 880);
+}
+
+function ensureStream(dir, pattern, tone) {
+  if (fs.existsSync(path.join(dir, 'index.m3u8'))) return;
+  step(`Generating test HLS stream in ${path.basename(dir)} with ffmpeg`);
+  fs.mkdirSync(dir, { recursive: true });
   const r = spawnSync(
     'ffmpeg',
     [
       '-y', '-loglevel', 'error',
-      '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=25',
-      '-f', 'lavfi', '-i', 'sine=frequency=440',
+      '-f', 'lavfi', '-i', `${pattern}=size=320x240:rate=25`,
+      '-f', 'lavfi', '-i', `sine=frequency=${tone}`,
       '-t', '20',
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-g', '50',
       '-c:a', 'aac',
       '-f', 'hls', '-hls_time', '2', '-hls_playlist_type', 'vod',
-      '-hls_segment_filename', path.join(streamDir, 'seg%d.ts'),
-      path.join(streamDir, 'index.m3u8'),
+      '-hls_segment_filename', path.join(dir, 'seg%d.ts'),
+      path.join(dir, 'index.m3u8'),
     ],
     { stdio: 'inherit' }
   );
@@ -99,7 +107,8 @@ function startRelay() {
   return new Promise((resolve, reject) => {
     const proc = spawn('node', [relayPath], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, RELAY_PORT: String(RELAY_PORT) },
+      // A short Swap on TV window, so a swap's discontinuity scrolls off within the test.
+      env: { ...process.env, RELAY_PORT: String(RELAY_PORT), RELAY_CHANNEL_WINDOW: '4' },
     });
     const timer = setTimeout(() => {
       proc.kill();
@@ -123,11 +132,12 @@ function startRelay() {
 const firstUri = (playlist) => playlist.split('\n').find((l) => l.trim() && !l.startsWith('#'))?.trim();
 
 async function main() {
-  ensureStream();
+  ensureStreams();
   fs.mkdirSync(artifactsDir, { recursive: true });
 
   const servers = await startServers({
     streamDir,
+    streamDirB,
     hlsJsPath: path.join(extDir, 'vendor/hls.min.js'),
   });
   let browser;
@@ -476,6 +486,208 @@ async function main() {
     const gifFrames = gif.frames().filter((f) => f.url().startsWith(`${RELAY}/cast/`));
     assert(gifFrames.length === 0, 'no cast controls are offered for it');
     await gif.close();
+
+    step('Swap on TV: two live streams cast as one channel, and Swap switches what the TV gets');
+    const hash = (b) => crypto.createHash('sha1').update(b).digest('hex');
+    const segHashes = (dir) => new Set(fs.readdirSync(dir).filter((f) => f.endsWith('.ts')).map((f) => hash(fs.readFileSync(path.join(dir, f)))));
+    const [aSegs, bSegs] = [segHashes(streamDir), segHashes(streamDirB)];
+    const streamOf = (bytes) => (aSegs.has(hash(bytes)) ? 'A' : bSegs.has(hash(bytes)) ? 'B' : `neither (starts ${bytes.subarray(0, 4).toString('hex')})`);
+    const tvGet = async (url) => {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`TV request ${url} -> HTTP ${r.status}: ${await r.text()}`);
+      return r;
+    };
+    // What a TV reads from a live media playlist.
+    const readPlaylist = async (url) => {
+      const text = await (await tvGet(url)).text();
+      const num = (tag) => Number(text.match(new RegExp(`#${tag}:(\\d+)`))?.[1] ?? 0);
+      const entries = [];
+      let disc = false;
+      let discNo = num('EXT-X-DISCONTINUITY-SEQUENCE'); // which stretch of timeline a segment is in
+      for (const line of text.split('\n').map((l) => l.trim())) {
+        if (line === '#EXT-X-DISCONTINUITY') disc = true;
+        else if (line && !line.startsWith('#')) {
+          if (disc) discNo++;
+          entries.push({ seq: num('EXT-X-MEDIA-SEQUENCE') + entries.length, uri: new URL(line, url).href, disc, discNo });
+          disc = false;
+        }
+      }
+      return { text, live: !text.includes('#EXT-X-ENDLIST'), seq: num('EXT-X-MEDIA-SEQUENCE'), discSeq: num('EXT-X-DISCONTINUITY-SEQUENCE'), entries };
+    };
+    const lastStream = async (pl) => streamOf(Buffer.from(await (await tvGet(pl.entries.at(-1).uri)).arrayBuffer()));
+    // From one refresh to the next, a segment number must keep pointing at the same segment, in
+    // the same stretch of timeline (its discontinuity number), or the TV misplaces it.
+    const assertConsistent = (before, after, what) => {
+      const was = new Map(before.entries.map((e) => [e.seq, e]));
+      const changed = after.entries.filter((e) => was.has(e.seq) && (was.get(e.seq).uri !== e.uri || was.get(e.seq).discNo !== e.discNo));
+      assert(
+        after.seq >= before.seq && after.discSeq >= before.discSeq && changed.length === 0,
+        `${what}: sequence numbers only move forward (${before.seq} -> ${after.seq}, discontinuity ${before.discSeq} -> ${after.discSeq}) and no segment changed meaning${changed.length ? ` (changed: ${JSON.stringify(changed)})` : ''}`
+      );
+    };
+    const swapTo = async (frame, before, expect) => {
+      // The ⚙ menu scrolls, and with two streams the cast controls can sit below its fold, as
+      // a user would see: bring them into view first.
+      await ch.$eval('#cast-frame', (f) => f.scrollIntoView({ block: 'start' }));
+      const was = await frame.$eval('#on-tv', (el) => el.textContent);
+      // A user could click it: it's enabled, and it's what sits under its own center, both in
+      // the cast page and in the player page around that frame.
+      const btn = await frame.$eval('#swap', (b) => {
+        const r = b.getBoundingClientRect();
+        const x = r.x + r.width / 2;
+        const y = r.y + r.height / 2;
+        return { x, y, disabled: b.disabled, onTop: document.elementFromPoint(x, y) === b, inView: y > 0 && y < innerHeight };
+      });
+      const pageHit = await ch.evaluate(({ x, y }) => {
+        const f = document.getElementById('cast-frame');
+        const r = f.getBoundingClientRect();
+        return document.elementFromPoint(r.x + x, r.y + y) === f && r.y + y < innerHeight;
+      }, btn);
+      assert(!btn.disabled && btn.onTop && btn.inView && pageHit, 'Swap on TV is enabled, visible, and not covered');
+      // Puppeteer's mouse doesn't reliably land in this cross-origin frame inside the scrolled
+      // menu (2 of 3 runs missed with everything above true), so activate it directly.
+      await frame.$eval('#swap', (b) => b.click());
+      await frame
+        .waitForFunction((w) => document.getElementById('on-tv').textContent !== w, { timeout: 5000 }, was)
+        .catch(async () => {
+          const shot = path.join(artifactsDir, 'swap-click-failed.png');
+          await ch.screenshot({ path: shot });
+          const note = await frame.$eval('#swap-note', (el) => el.textContent).catch((e) => `unreadable: ${e.message}`);
+          const error = await frame.$eval('#error', (el) => (el.hidden ? '' : el.textContent)).catch((e) => `unreadable: ${e.message}`);
+          const btn = await frame.$eval('#swap', (b) => {
+            const r = b.getBoundingClientRect();
+            return { x: r.x + r.width / 2, y: r.y + r.height / 2, disabled: b.disabled };
+          });
+          const under = await ch.evaluate(({ x, y }) => {
+            const f = document.getElementById('cast-frame').getBoundingClientRect();
+            const el = document.elementFromPoint(f.x + x, f.y + y);
+            return `${el?.tagName}#${el?.id} at (${Math.round(f.x + x)}, ${Math.round(f.y + y)})`;
+          }, btn);
+          throw new Error(
+            `clicking Swap on TV did nothing (the cast controls still say "${was}"; note "${note}"; error "${error}"; button disabled=${btn.disabled}; the player page has ${under} under the button). Screenshot: ${shot}`
+          );
+        });
+      // The new stream joins at the next playlist refresh the TV makes.
+      const deadline = Date.now() + 15000;
+      for (;;) {
+        const pl = await readPlaylist(chMedia);
+        const discs = pl.entries.filter((e) => e.disc).length + pl.discSeq;
+        if (discs > before.entries.filter((e) => e.disc).length + before.discSeq && (await lastStream(pl)) === expect) return pl;
+        if (Date.now() > deadline) throw new Error(`the TV's playlist never switched to stream ${expect}:\n${pl.text}`);
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    };
+
+    const twoLive = await browser.newPage();
+    await twoLive.goto(SITE + '/two-live');
+    await twoLive.waitForFrame((f) => f.url().startsWith(EMBED));
+    await twoLive.bringToFront();
+    const openPopup = async (tab) => {
+      const known = new Set(browser.targets());
+      const p = browser.waitForTarget((t) => !known.has(t) && t.url().includes('/popup.html'), { timeout: 5000 });
+      await ext.triggerAction(tab);
+      return (await p).asPage();
+    };
+    const itemFor = async (popup, text) => {
+      await popup.waitForSelector(`::-p-text(${text})`, { timeout: 10000 });
+      for (const li of await popup.$$('li')) if ((await li.evaluate((el) => el.textContent)).includes(text)) return li;
+      throw new Error(`no popup entry for ${text}`);
+    };
+    const knownTargets = new Set(browser.targets());
+    const chP = browser.waitForTarget((t) => !knownTargets.has(t) && t.url().includes('/player.html'), { timeout: 5000 });
+    await (await (await itemFor(await openPopup(twoLive), 'a/master.m3u8')).$('button::-p-text(Open in player)')).click();
+    const ch = await (await chP).asPage();
+    await ch.bringToFront(); // "Add to player" goes to the player tab used last
+    await waitForPlayback(ch, 'player on live stream A');
+    await twoLive.bringToFront();
+    const addPopup = await openPopup(twoLive);
+    await (await (await itemFor(addPopup, 'b/master.m3u8')).$('button::-p-text(Add to player)')).click();
+    const addStatus = await addPopup.$eval('#status', (el) => el.textContent).catch(() => '(popup closed)');
+    await ch.bringToFront();
+    await ch
+      .waitForFunction(() => [...document.querySelectorAll('video')].filter((v) => !v.hidden && v.currentTime >= 1).length === 2, {
+        timeout: 20000,
+        polling: 250,
+      })
+      .catch(async (err) => {
+        const state = await ch.evaluate(() => ({
+          videos: [...document.querySelectorAll('video')].map((v) => ({ hidden: v.hidden, t: v.currentTime, paused: v.paused })),
+          problems: document.getElementById('problems')?.textContent,
+        }));
+        throw new Error(`both live streams never played in one player: ${JSON.stringify(state)}; popup said "${addStatus}" (${err.message})`);
+      });
+    ok('the player plays live stream A big and live stream B small');
+
+    await ch.click('::-p-aria(Settings)');
+    await ch.click('button::-p-text(Cast via relay)');
+    const chFrame = await ch.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 15000 });
+    const chMedia = (await waitForText(chFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
+    const playing = await ch.$$eval('video', (vs) => vs.filter((v) => !v.hidden && !v.paused).length);
+    assert(playing === 0, `the tab stops both of its own videos while the TV plays them (${playing} still playing)`);
+
+    const pl1 = await readPlaylist(chMedia);
+    assert(pl1.live && pl1.entries.length >= 2, `the TV gets one live playlist (${pl1.entries.length} segments, no end tag)`);
+    assert((await lastStream(pl1)) === 'A', 'it plays the big stream, A');
+    await new Promise((r) => setTimeout(r, 2500)); // a live refresh, before swapping
+    const pl1b = await readPlaylist(chMedia);
+    assertConsistent(pl1, pl1b, 'a plain refresh');
+    assert(pl1b.entries.at(-1).seq > pl1.entries.at(-1).seq, `new live segments keep arriving (${pl1.entries.at(-1).seq} -> ${pl1b.entries.at(-1).seq})`);
+
+    const pl2 = await swapTo(chFrame, pl1b, 'B');
+    ok('after Swap on TV, the playlist continues with stream B after a discontinuity');
+    assertConsistent(pl1b, pl2, 'the swap to B');
+    await waitForText(chFrame, /On TV:.*b\/master\.m3u8/);
+    ok('the cast controls say B is on the TV');
+
+    const pl3 = await swapTo(chFrame, pl2, 'A');
+    ok('swapping again goes back to stream A');
+    assertConsistent(pl2, pl3, 'the swap back to A');
+    // The relay runs with a 4-segment window here, so the first swap scrolls off the top.
+    let pl4 = pl3;
+    for (const deadline = Date.now() + 15000; pl4.discSeq < 1; ) {
+      if (Date.now() > deadline) throw new Error(`the first swap never scrolled off the TV's playlist:\n${pl4.text}`);
+      await new Promise((r) => setTimeout(r, 1000));
+      pl4 = await readPlaylist(chMedia);
+    }
+    assert(pl4.seq > pl1.seq, `old segments scroll off as live goes on (media sequence ${pl1.seq} -> ${pl4.seq})`);
+    assertConsistent(pl3, pl4, 'after a swap scrolls off the top');
+    await ch.close();
+    await twoLive.close();
+
+    // A real stream's source paused for 11 s (Nov 2026) while the TV sat 2 s behind its newest
+    // segment, so the TV buffered. The relay keeps a few segments in reserve and hands them over
+    // at the pace they play, so a short pause at the source never reaches the TV.
+    step('One live stream: a pause at its source does not stop new segments reaching the TV');
+    const steady = await browser.newPage();
+    await steady.goto(`chrome-extension://${ext.id}/player.html`);
+    await steady.type('input[name=url]', MASTER_URL.replace('/live/', '/live/stall/'));
+    await steady.type('input[name=referer]', EMBED + '/');
+    await steady.click('button::-p-text(Play)');
+    await waitForPlayback(steady, 'player on the pausing live stream');
+    // Manual mode leaves the ⚙ menu open (it holds the URL form), so the relay button is in view.
+    await steady.click('button::-p-text(Cast via relay)');
+    const steadyFrame = await steady.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 15000 });
+    let steadyMedia = (await waitForText(steadyFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
+    // Like the TV, follow a master playlist to the variant it plays.
+    const firstLoad = await (await tvGet(steadyMedia)).text();
+    if (firstLoad.includes('#EXT-X-STREAM-INF')) steadyMedia = new URL(firstUri(firstLoad), steadyMedia).href;
+    let tvPl = await readPlaylist(steadyMedia);
+    assert(tvPl.live && tvPl.entries.length >= 2, `the TV gets a live playlist (${tvPl.entries.length} segments)`);
+    servers.stallLive(7000);
+    const stallStart = Date.now();
+    const lastAtStall = tvPl.entries.at(-1).seq;
+    while (Date.now() - stallStart < 6500) {
+      await new Promise((r) => setTimeout(r, 500));
+      const now = await readPlaylist(steadyMedia);
+      assertConsistent(tvPl, now, 'a refresh while the source is paused');
+      tvPl = now;
+    }
+    const gained = tvPl.entries.at(-1).seq - lastAtStall;
+    assert(gained >= 2, `during a 7 s pause at the source, the TV's playlist still gained ${gained} new segments (needs 2 or more)`);
+    assert((await lastStream(tvPl)) === 'A', 'the newest segment the TV sees is real video from the stream');
+    const reserveNote = await waitForText(steadyFrame, /keeps \d+ s of video in reserve/);
+    ok(`the cast controls say how much video the relay keeps in reserve: "${reserveNote}"`);
+    await steady.close();
 
     step('Manual mode: paste URL + Referer into the player page');
     const manual = await browser.newPage();

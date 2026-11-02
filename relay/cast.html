@@ -16,6 +16,7 @@
     h1 { font-size: 18px; margin: 0; }
     code { font: 12px/1.4 ui-monospace, Menlo, monospace; word-break: break-all; }
     .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+    .panel[hidden] { display: none; } /* .panel's display: grid would otherwise override [hidden] */
     .muted { color: var(--muted); }
     .error { color: var(--error); white-space: pre-wrap; }
     .ok { color: var(--ok); }
@@ -44,6 +45,14 @@
   </div>
   <div id="state" class="muted">Loading the Google Cast SDK…</div>
   <div id="error" class="error" hidden></div>
+  <div class="panel" id="swap-panel" hidden>
+    <div id="on-tv">On TV: …</div>
+    <div class="row">
+      <button id="swap" class="secondary" disabled>Swap on TV</button>
+      <label class="muted">After a swap, start <input id="behind" type="number" min="0" max="60" step="1" value="0" style="width: 4em"> s behind live</label>
+    </div>
+    <div class="muted" id="swap-note"></div>
+  </div>
   <div class="muted" style="font-size: 12px">Beta: the relay is experimental. Some streams play fine; others buffer on the TV.</div>
   <a class="standalone muted" id="standalone" target="_blank">Cast button not working here? Open the cast page in its own tab</a>
 
@@ -51,6 +60,7 @@
     <div class="muted">Chromecast will load</div>
     <code id="media-url">…</code>
     <div class="muted" id="stream-info"></div>
+    <div class="muted" id="reserve"></div>
   </div>
 
   <div class="panel">
@@ -87,10 +97,89 @@
     return body;
   }
 
+  // ---- Swap on TV (casts with two streams) ----
+  let castContext = null; // set once the Cast SDK is ready
+  const BEHIND_KEY = 'swapSecondsBehindLive';
+  const showOnTv = (ch) => ($('on-tv').textContent = `On TV: ${ch.labels[ch.active]}`);
+  const setSwapNote = (msg, cls = 'muted') => { $('swap-note').textContent = msg; $('swap-note').className = cls; };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // The setting is a convenience for whoever uses this page; without storage it starts at 0.
+  try {
+    const saved = localStorage.getItem(BEHIND_KEY);
+    if (saved !== null) $('behind').value = saved;
+  } catch (err) {
+    console.warn('[cast] could not read the saved "behind live" setting; using 0', err);
+  }
+  $('behind').addEventListener('change', () => {
+    try {
+      localStorage.setItem(BEHIND_KEY, $('behind').value);
+    } catch (err) {
+      console.warn('[cast] could not save the "behind live" setting', err);
+    }
+  });
+
+  // The SDK's callback-style media calls, as promises.
+  const mediaCall = (fn) => new Promise((resolve, reject) => fn(resolve, (e) => reject(new Error(e?.description || e?.code || String(e)))));
+
+  async function swapOnTv() {
+    $('swap').disabled = true;
+    $('error').hidden = true;
+    try {
+      const r = await fetch(`/api/streams/${id}/switch`, { method: 'POST' });
+      const ch = await r.json();
+      if (!r.ok) throw new Error(ch.error || `HTTP ${r.status}`);
+      showOnTv(ch);
+      const label = ch.labels[ch.active];
+      const media = castContext?.getCurrentSession()?.getMediaSession();
+      if (!media) {
+        setSwapNote(`The relay is sending ${label} now. No TV is playing from this page, so there is no live edge to jump to.`);
+        return;
+      }
+      // The jump has to wait until the TV's playlist includes the new stream.
+      setSwapNote(`Waiting for the TV to pick up ${label}…`);
+      const deadline = Date.now() + 20000;
+      for (;;) {
+        const sw = (await loadStream()).channel?.switch;
+        if (sw?.n === ch.switch.n && sw.tvSawAt) break;
+        if (Date.now() > deadline) throw new Error(`the TV didn't refresh its playlist within 20s, so it can't jump to ${label} yet. It will reach it after playing what it has buffered.`);
+        await sleep(300);
+      }
+      await sleep(1000); // let the receiver take in the new playlist before asking where live is
+      await mediaCall((ok, err) => media.getStatus(null, ok, err));
+      const range = media.liveSeekableRange;
+      if (!range) throw new Error(`the TV didn't report a live range, so it can't jump. It will reach ${label} after playing what it has buffered.`);
+      const behind = Math.max(0, Number($('behind').value) || 0);
+      const target = Math.max(range.start, range.end - behind);
+      const seek = new chrome.cast.media.SeekRequest();
+      seek.currentTime = target;
+      await mediaCall((ok, err) => media.seek(seek, ok, err));
+      setSwapNote(`Jumped the TV to ${label}, ${(range.end - target).toFixed(1)} s behind live.`, 'ok');
+    } catch (err) {
+      setSwapNote('');
+      showError(`Swap on TV: ${err.message}`);
+    } finally {
+      $('swap').disabled = false;
+    }
+  }
+  $('swap').addEventListener('click', swapOnTv);
+
+  // How much video the relay holds back, so short pauses at the source don't reach the TV.
+  function showReserve(r) {
+    // The running relay reads this page fresh on each load, so an older relay can serve it.
+    $('reserve').textContent = !r
+      ? 'No reserve: this relay was started before the reserve existed. Restart it to get one.'
+      : r.why
+      ? `No reserve: ${r.why}, so the relay passes its playlists through unchanged.`
+      : `The relay keeps ${Math.round(r.seconds)} s of video in reserve${r.measured ? '' : ' (once the TV starts)'}, so a pause at the stream's source shorter than that doesn't reach the TV. The TV plays that much further behind live.`;
+  }
+
   // Poll the relay so it's visible whether the TV is fetching, and what the CDN says.
   async function poll() {
     try {
       const s = await loadStream();
+      if (s.channel) showOnTv(s.channel);
+      showReserve(s.reserve);
       const st = s.stats;
       $('activity').textContent = st.requests
         ? `${st.requests} requests · last at ${new Date(st.lastRequestAt).toLocaleTimeString()}`
@@ -112,7 +201,15 @@
     .then((s) => {
       stream = s;
       $('media-url').textContent = s.mediaUrl;
-      $('stream-info').textContent = `${s.info.live ? 'Live' : 'On-demand'} · ${s.info.segmentFormat === 'fmp4' ? 'fMP4' : 'MPEG-TS'} segments · source ${s.url}`;
+      $('stream-info').textContent = s.channel
+        ? `Live · MPEG-TS segments · one channel from two streams: ${s.channel.labels.join(' and ')}`
+        : `${s.info.live ? 'Live' : 'On-demand'} · ${s.info.segmentFormat === 'fmp4' ? 'fMP4' : 'MPEG-TS'} segments · source ${s.url}`;
+      showReserve(s.reserve);
+      if (s.channel) {
+        $('swap-panel').hidden = false;
+        $('swap').disabled = false;
+        showOnTv(s.channel);
+      }
       setInterval(poll, 2000);
       poll();
     })
@@ -138,7 +235,7 @@
   };
 
   function initCast() {
-    const context = cast.framework.CastContext.getInstance();
+    const context = (castContext = cast.framework.CastContext.getInstance());
     context.setOptions({
       receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
       autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED,

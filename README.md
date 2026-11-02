@@ -117,8 +117,10 @@ and then `[relay] ready`.
 ### Cast
 
 1. Open a stream in the player (**Open in player** in the popup).
-2. Open the ⚙ menu and click **Cast via relay (beta)**. It casts the big picture's stream. The
-   player checks the stream, then shows the cast controls below the buttons.
+2. Open the ⚙ menu and click **Cast via relay (beta)**. With one stream in the player, it casts
+   that. With two, it casts both as one channel you can swap (see
+   [Swap on TV](#swap-on-tv)). The player checks the streams, then shows the cast controls below
+   the buttons.
 3. Click **Cast to TV** and choose your Chromecast.
 
 Playback on your computer stops when the TV takes over, so the stream isn't downloaded twice.
@@ -127,15 +129,40 @@ Press **Play** to watch on the computer again.
 If the device picker doesn't open from inside the player, click **Open the cast page in its own
 tab** and cast from there.
 
+### Swap on TV
+
+With two streams in the player (say a game and a whip-around channel), **Cast via relay** gives
+the TV one channel, and **Swap on TV** in the cast controls switches which stream it shows. The TV
+shows one at a time, full screen.
+
+- **It jumps to live.** After the relay switches streams, the cast page waits until the TV has
+  picked up the new one, then moves the TV to its live edge. **After a swap, start _N_ s behind
+  live** sets how far back it lands. It starts at 0; raise it if the TV buffers right after a
+  swap. The setting is saved in that browser.
+- **Both streams must be live MPEG-TS**, unencrypted, with sound in the same stream as the
+  picture. If one isn't, casting stops and says which stream to remove (× on the small picture).
+- **Only the stream on the TV is downloaded.** The other one isn't fetched until you swap to it,
+  and the player tab stops both of its own videos while casting.
+- Each swap is a cut, marked in the playlist so the TV resets its clock for the new stream.
 ### Keep in mind
 
 - **Keep the player tab open.** It does the fetching for the TV. If you close it, the TV stops,
   and the cast controls show a warning.
-- **One stream at a time.** Starting a new relay cast stops the previous one, and the old tab says
-  so.
+- **One cast at a time.** Starting a new relay cast stops the previous one, and the old tab says
+  so. (A cast can hold two streams for [Swap on TV](#swap-on-tv).)
 - **Your computer must stay awake** and on the same network as the Chromecast.
 - **Watch the "Relay activity" box** if the TV stalls. It shows how many requests the TV has made
   and any errors from the stream server.
+- **The relay keeps live video in reserve.** Stream sources sometimes stop adding video for a
+  few seconds, and the Chromecast plays only a second or two behind the newest segment, so it
+  buffers. For live MPEG-TS streams, the relay lists each new segment to the TV 12 seconds after
+  it appears, and fetches it ahead of time. A pause shorter than the reserve doesn't reach the
+  TV; the cost is that the TV plays that much further behind live. A stream whose playlist is
+  short gets less (the TV always gets at least two segments). The cast controls show the amount
+  in use, or why a stream gets none (on-demand, fMP4, separate audio, or encrypted streams are
+  passed through unchanged).
+- **The relay keeps each segment for 30 seconds**, because the Chromecast asks for most of them
+  twice. The second request is answered from memory instead of fetched again through Chrome.
 
 ### Security
 
@@ -153,6 +180,8 @@ do with it:
 | Relay port | `8788` | `RELAY_PORT=9000 node relay/server.mjs` |
 | Address the TV uses | First IPv4 address found (`en0` first) | `RELAY_HOST=192.168.1.20 node relay/server.mjs` |
 | Relay address the extension uses | `http://localhost:8788` | See below |
+| Segments the relay lists to the TV for a live stream | `12` | `RELAY_CHANNEL_WINDOW=8 node relay/server.mjs` |
+| Seconds of live video kept in reserve | `12` | `RELAY_HOLD_SECONDS=20 node relay/server.mjs` (`0` turns it off) |
 
 If you change the port, tell the extension too. Open the player tab, open DevTools (⌥⌘I), and run
 this in the Console:
@@ -242,6 +271,12 @@ It checks what a user would see:
 - The relay refuses hosts outside the stream.
 - Segments disguised as PNG or WebP images play in the player and reach the TV as plain
   MPEG-TS. A segment in an image format nobody decodes stops the cast with a reason.
+- Two live streams cast as one channel. Swap on TV switches it to the other stream and back, and
+  the TV's playlist stays consistent through swaps: segment numbers only move forward and never
+  change meaning, including when a swap scrolls off the top. (The jump to live needs a real
+  Chromecast, so the test can't cover it.)
+- A live stream whose source stops adding segments for 7 seconds keeps gaining segments in the
+  TV's playlist, from the relay's reserve, and the cast controls say how much is in reserve.
 - Failures, such as a 403 or a relay that isn't running, show up on screen.
 
 To run it you need `ffmpeg` on your PATH. The first run uses it to generate a short test stream.

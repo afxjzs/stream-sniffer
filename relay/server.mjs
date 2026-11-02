@@ -52,11 +52,13 @@ function lanAddress() {
 const b64 = (s) => Buffer.from(s).toString('base64url');
 const unb64 = (s) => Buffer.from(s, 'base64url').toString('utf8');
 
-// /s/<id>/r/<base64url upstream>/<filename>. The trailing filename (e.g. seg1.ts) is only a
-// hint for players that sniff by extension; the base64 part is what's used.
-function relayPath(id, upstream) {
+// /s/<id>/r<src>/<base64url upstream>/<filename>. <src> is which of the cast's streams it
+// belongs to (empty for the first), so the player tab fetches it with that stream's headers.
+// The trailing filename (e.g. seg1.ts) is only a hint for players that sniff by extension; the
+// base64 part is what's used.
+function relayPath(id, upstream, src = 0) {
   const name = (new URL(upstream).pathname.split('/').pop() || 'x').replace(/[^\w.-]/g, '_') || 'x';
-  return `/s/${id}/r/${b64(upstream)}/${name}`;
+  return `/s/${id}/r${src || ''}/${b64(upstream)}/${name}`;
 }
 
 function rewritePlaylist(text, base, id, stream) {
@@ -81,10 +83,11 @@ function recordError(id, stream, err) {
   console.error(`[relay] ${id}: ${err}`);
 }
 
-// Hands a URL to the player tab and waits for it to come back with the response.
-function bridgeFetch(stream, url) {
+// Hands a URL to the player tab and waits for it to come back with the response. src says
+// which of the cast's streams it belongs to, so the tab sends that stream's headers.
+function bridgeFetch(stream, url, src = 0) {
   return new Promise((resolve, reject) => {
-    const job = { id: crypto.randomBytes(6).toString('hex'), url };
+    const job = { id: crypto.randomBytes(6).toString('hex'), url, src };
     const timer = setTimeout(() => {
       stream.pending.delete(job.id);
       const i = stream.queue.indexOf(job);
@@ -99,10 +102,10 @@ function bridgeFetch(stream, url) {
 }
 
 // Fetches one upstream resource through the player tab. Playlists come back rewritten.
-async function fetchUpstream(id, stream, upstream) {
+async function fetchUpstream(id, stream, upstream, src = 0) {
   let res;
   try {
-    res = await bridgeFetch(stream, upstream);
+    res = await bridgeFetch(stream, upstream, src);
   } catch (err) {
     recordError(id, stream, err.message);
     return { status: 504, error: err.message };
@@ -122,7 +125,7 @@ async function fetchUpstream(id, stream, upstream) {
   const isPlaylist = /mpegurl/i.test(type) || body.subarray(0, 7).toString() === '#EXTM3U';
   if (isPlaylist) {
     const text = rewritePlaylist(body.toString('utf8'), res.finalUrl, id, stream);
-    return { status: 200, isPlaylist, raw: body.toString('utf8'), body: Buffer.from(text), type: 'application/vnd.apple.mpegurl' };
+    return { status: 200, isPlaylist, raw: body.toString('utf8'), finalUrl: res.finalUrl, body: Buffer.from(text), type: 'application/vnd.apple.mpegurl' };
   }
   // Some CDNs disguise TS segments as images (see extension/disguise.js). The Chromecast can't
   // decode those the way the site's own player does, so hand it plain MPEG-TS.
@@ -182,6 +185,275 @@ async function probe(id, stream) {
       segmentFormat: /#EXT-X-MAP/.test(media) || /\.(m4s|mp4)(\?|$)/i.test(firstSeg) ? 'fmp4' : 'ts',
     },
   };
+}
+
+// ---- Swap on TV ----------------------------------------------------------------------------
+//
+// With two live streams, the relay serves the TV one live playlist that it builds itself: each
+// refresh adds the newest segments of whichever stream is active. A swap marks a discontinuity
+// and continues from the other stream, starting at its current live window. The inactive
+// stream isn't fetched at all. Only live MPEG-TS streams without encryption qualify; anything
+// else is refused at the probe, with the reason.
+
+// Segments listed to the TV; old ones scroll off, as in any live playlist. RELAY_CHANNEL_WINDOW
+// overrides it (the E2E test uses a short one); startup prints it when overridden.
+const CHANNEL_WINDOW = Number(process.env.RELAY_CHANNEL_WINDOW || 12);
+if (!Number.isInteger(CHANNEL_WINDOW) || CHANNEL_WINDOW < 3) {
+  throw new Error(`RELAY_CHANNEL_WINDOW must be a whole number of at least 3 (got ${JSON.stringify(process.env.RELAY_CHANNEL_WINDOW)})`);
+}
+
+// Seconds of video the relay keeps in reserve: each new segment is listed to the TV this long
+// after the relay first sees it. A source that pauses for less than this never starves the TV,
+// which otherwise plays a second or two behind the newest segment. A stream whose playlist is
+// too short gets less (the TV is always given at least two segments); the cast page shows the
+// amount in use. RELAY_HOLD_SECONDS overrides it; startup prints it when overridden.
+const HOLD_SECONDS = Number(process.env.RELAY_HOLD_SECONDS ?? 12);
+if (!Number.isFinite(HOLD_SECONDS) || HOLD_SECONDS < 0) {
+  throw new Error(`RELAY_HOLD_SECONDS must be a number of seconds, 0 or more (got ${JSON.stringify(process.env.RELAY_HOLD_SECONDS)})`);
+}
+
+// The parts of a media playlist the channel needs. Throws for features it can't carry over.
+function parseMediaPlaylist(text, base) {
+  if (!text.trimStart().startsWith('#EXTM3U')) throw new Error('not an HLS playlist');
+  const pl = { seq: 0, discSeq: 0, target: 0, ended: false, segs: [] };
+  let dur = null;
+  let disc = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const value = line.slice(line.indexOf(':') + 1);
+    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) pl.seq = Number(value);
+    else if (line.startsWith('#EXT-X-DISCONTINUITY-SEQUENCE:')) pl.discSeq = Number(value);
+    else if (line.startsWith('#EXT-X-TARGETDURATION:')) pl.target = Number(value);
+    else if (line.startsWith('#EXTINF:')) dur = parseFloat(value);
+    else if (line === '#EXT-X-DISCONTINUITY') disc = true;
+    else if (line === '#EXT-X-ENDLIST') pl.ended = true;
+    else if (line.startsWith('#EXT-X-MAP')) throw new Error('uses fMP4 segments, which Swap on TV does not handle yet');
+    else if (line.startsWith('#EXT-X-BYTERANGE')) throw new Error('uses byte-range segments, which Swap on TV does not handle yet');
+    else if (line.startsWith('#EXT-X-KEY') && !/METHOD=NONE/.test(line)) throw new Error('is encrypted, which Swap on TV does not handle yet');
+    else if (!line.startsWith('#')) {
+      if (dur == null || Number.isNaN(dur)) throw new Error(`segment ${line} has no #EXTINF duration`);
+      pl.segs.push({ seq: pl.seq + pl.segs.length, uri: new URL(line, base).href, dur, disc });
+      dur = null;
+      disc = false;
+    }
+  }
+  if (!pl.segs.length) throw new Error('lists no segments');
+  return pl;
+}
+
+// The media playlist for a stream: the URL itself, or the highest-bandwidth variant of a master.
+async function resolveMedia(id, stream, src) {
+  const s = stream.sources[src];
+  const top = await fetchUpstream(id, stream, s.url, src);
+  if (top.error) return { error: top.error };
+  if (!top.isPlaylist) return { error: `${s.url} did not return an HLS playlist` };
+  if (!/#EXT-X-STREAM-INF/.test(top.raw)) return { mediaUrl: top.finalUrl || s.url, raw: top.raw };
+  if (/#EXT-X-MEDIA:[^\n]*TYPE=AUDIO[^\n]*URI=/.test(top.raw)) {
+    return { unsupported: 'has its sound in a separate track, which Swap on TV does not handle yet' };
+  }
+  const lines = top.raw.split(/\r?\n/);
+  let best = null;
+  lines.forEach((line, i) => {
+    if (!line.startsWith('#EXT-X-STREAM-INF')) return;
+    const bw = Number(line.match(/[:,]BANDWIDTH=(\d+)/)?.[1] ?? 0);
+    const uri = lines.slice(i + 1).find((l) => l.trim() && !l.startsWith('#'));
+    if (uri && (!best || bw > best.bw)) best = { bw, url: new URL(uri.trim(), top.finalUrl || s.url).href };
+  });
+  if (!best) return { unsupported: 'is a master playlist with no variants' };
+  const v = await fetchUpstream(id, stream, best.url, src);
+  if (v.error) return { error: v.error };
+  if (!v.isPlaylist) return { error: `${best.url} did not return an HLS playlist` };
+  return { mediaUrl: v.finalUrl || best.url, raw: v.raw };
+}
+
+// Checks both streams before casting: each must be a live MPEG-TS playlist whose first segment
+// the TV can play. A failure names the stream, so the player can say which one to remove.
+async function probeChannel(id, stream) {
+  for (const [src, s] of stream.sources.entries()) {
+    const fail = (why) => ({ why, error: `Swap on TV can't use "${s.label}": it ${why}. Remove it (× on the small picture) to cast just the other one.` });
+    const media = await resolveMedia(id, stream, src);
+    if (media.unsupported) return fail(media.unsupported);
+    if (media.error) return fail(`failed: ${media.error}`);
+    let pl;
+    try {
+      pl = parseMediaPlaylist(media.raw, media.mediaUrl);
+    } catch (err) {
+      return fail(err.message);
+    }
+    if (pl.ended) return fail('is on-demand, not live');
+    for (const seg of pl.segs) stream.hosts.add(new URL(seg.uri).host);
+    const first = await fetchUpstream(id, stream, pl.segs[0].uri, src);
+    if (first.error) return fail(`failed: ${first.error}`);
+    s.mediaUrl = media.mediaUrl;
+    console.log(`[relay] ${id}: stream ${src + 1} is live MPEG-TS, ok to relist: ${s.label} (${media.mediaUrl})`);
+  }
+  return { info: { live: true, segmentFormat: 'ts', channel: true } };
+}
+
+function newChannel() {
+  return {
+    active: 0,
+    entries: [], // { seq, src, uri, dur, disc } as listed to the TV
+    nextSeq: 0,
+    discSeq: 0, // discontinuities that have scrolled off the top
+    target: 0,
+    lastSeq: [null, null], // per stream: the newest of its segments already added
+    pendingSwitch: false,
+    switch: null, // the latest swap: { n, to, label, at, firstSeq, tvSawAt }
+    refreshing: null,
+    refreshedAt: 0,
+    joining: true, // the next refresh is the first from this stream (at the start, or after a swap)
+    reserveSeconds: null, // the reserve in use, once the first refresh has seen the playlist
+  };
+}
+
+// Adds the active stream's new segments. At most one refresh at a time, and none more often
+// than every half target duration, however many requests the TV makes.
+function refreshChannel(id, stream) {
+  const ch = stream.channel;
+  if (ch.refreshing) return ch.refreshing;
+  if (ch.entries.length && Date.now() - ch.refreshedAt < ch.target * 500) return Promise.resolve();
+  ch.refreshing = (async () => {
+    const src = ch.active;
+    const s = stream.sources[src];
+    const r = await fetchUpstream(id, stream, s.mediaUrl, src);
+    if (r.error) throw new Error(`refreshing "${s.label}": ${r.error}`);
+    if (!r.isPlaylist) throw new Error(`refreshing "${s.label}": ${s.mediaUrl} did not return a playlist`);
+    // Swapped while this was in flight: this stream's segments no longer belong on the TV, and
+    // the swap's own refresh adds the other stream's.
+    if (ch.active !== src) return;
+    const pl = parseMediaPlaylist(r.raw, r.finalUrl || s.mediaUrl);
+    if (pl.ended) throw new Error(`"${s.label}" has ended (its playlist now has #EXT-X-ENDLIST)`);
+    ch.target = Math.max(ch.target, pl.target);
+    const last = ch.lastSeq[src];
+    const fresh = (last == null ? pl.segs : pl.segs.filter((x) => x.seq > last)).map((x) => ({ ...x }));
+    if (fresh.length) {
+      // Segments we never saw (a long gap between refreshes) break the timeline like a swap does.
+      if (last != null && fresh[0].seq > last + 1) fresh[0].disc = true;
+      if (ch.pendingSwitch) {
+        fresh[0].disc = ch.entries.length > 0;
+        ch.pendingSwitch = false;
+        ch.switch.firstSeq = ch.nextSeq;
+      }
+      // When each segment is listed to the TV: reserveSeconds after the relay first saw it.
+      // Joining a stream, its whole playlist arrives at once, so date those segments as if they
+      // had arrived one by one, the newest now; the older ones are then listed at once.
+      const now = Date.now();
+      let seenAt = fresh.map(() => now);
+      if (ch.joining) {
+        const total = fresh.reduce((t, x) => t + x.dur, 0);
+        const firstTwo = fresh.slice(0, 2).reduce((t, x) => t + x.dur, 0);
+        ch.reserveSeconds = Math.min(HOLD_SECONDS, Math.max(0, total - firstTwo));
+        let t = now;
+        for (let i = fresh.length - 1; i >= 0; i--) {
+          seenAt[i] = t;
+          t -= fresh[i].dur * 1000;
+        }
+        ch.joining = false;
+        console.log(`[relay] ${id}: keeping ${ch.reserveSeconds.toFixed(1)} s of "${s.label}" in reserve (setting: ${HOLD_SECONDS} s; its playlist lists ${total.toFixed(1)} s)`);
+      }
+      for (const [i, x] of fresh.entries()) {
+        stream.hosts.add(new URL(x.uri).host);
+        const listAt = seenAt[i] + ch.reserveSeconds * 1000;
+        ch.entries.push({ seq: ch.nextSeq++, src, uri: x.uri, dur: x.dur, disc: x.disc, listAt });
+        // Fetch reserved segments now, so the TV's request for each is answered from memory.
+        if (listAt > now) cachedFetch(id, stream, x.uri, src).catch((err) => recordError(id, stream, `fetching a reserved segment early: ${err.message}`));
+      }
+      ch.lastSeq[src] = pl.segs.at(-1).seq;
+    }
+    ch.refreshedAt = Date.now();
+  })().finally(() => {
+    ch.refreshing = null;
+  });
+  return ch.refreshing;
+}
+
+// The segments the TV may see now: those whose time in reserve is up, newest CHANNEL_WINDOW.
+// Older ones scroll off for good.
+function listedEntries(ch) {
+  const now = Date.now();
+  let listed = ch.entries.filter((e) => e.listAt <= now).length;
+  for (; listed > CHANNEL_WINDOW; listed--) if (ch.entries.shift().disc) ch.discSeq++;
+  return ch.entries.slice(0, listed);
+}
+
+function channelPlaylist(id, ch) {
+  const entries = listedEntries(ch);
+  const target = Math.max(ch.target, ...entries.map((e) => Math.ceil(e.dur)));
+  const lines = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    `#EXT-X-TARGETDURATION:${target}`,
+    `#EXT-X-MEDIA-SEQUENCE:${entries[0].seq}`,
+    `#EXT-X-DISCONTINUITY-SEQUENCE:${ch.discSeq}`,
+  ];
+  for (const e of entries) {
+    if (e.disc) lines.push('#EXT-X-DISCONTINUITY');
+    lines.push(`#EXTINF:${e.dur.toFixed(3)},`, relayPath(id, e.uri, e.src));
+  }
+  return lines.join('\n') + '\n';
+}
+
+async function serveChannel(id, stream, res) {
+  const ch = stream.channel;
+  const started = Date.now();
+  try {
+    await refreshChannel(id, stream);
+  } catch (err) {
+    // The TV keeps what it has; the error shows in Relay activity. With nothing at all, fail.
+    recordError(id, stream, err.message);
+    if (!ch.entries.length) return send(res, 502, err.message, { 'content-type': 'text/plain' });
+  }
+  if (ch.switch && ch.switch.firstSeq != null && !ch.switch.tvSawAt) ch.switch.tvSawAt = new Date().toISOString();
+  const body = channelPlaylist(id, ch);
+  recordRequest(stream, { file: 'live.m3u8', status: 200, bytes: body.length, ms: Date.now() - started, type: 'application/vnd.apple.mpegurl' });
+  send(res, 200, body, { 'content-type': 'application/vnd.apple.mpegurl' });
+}
+
+// POST /api/streams/<id>/switch: swap which stream the TV gets.
+function switchChannel(id, stream, res) {
+  const ch = stream.channel;
+  if (!ch || stream.sources.length < 2) return sendJson(res, 400, { error: 'this cast has one stream; add a second one to the player and cast again to swap' });
+  if (!stream.info) return sendJson(res, 409, { error: 'the streams have not been checked yet' });
+  // Segments of the old stream still in reserve never reach the TV; the swap takes effect now.
+  const listed = listedEntries(ch);
+  ch.entries = listed;
+  ch.nextSeq = listed.length ? listed.at(-1).seq + 1 : ch.nextSeq;
+  ch.active = 1 - ch.active;
+  ch.lastSeq[ch.active] = null; // join the new stream at its live window, not where we left it
+  ch.joining = true;
+  ch.pendingSwitch = true;
+  ch.refreshedAt = 0;
+  const label = stream.sources[ch.active].label;
+  ch.switch = { n: (ch.switch?.n ?? 0) + 1, to: ch.active, label, at: new Date().toISOString(), firstSeq: null, tvSawAt: null };
+  console.log(`[relay] ${id}: swapped the TV to "${label}"`);
+  // Fetch the new stream now (after any refresh already in flight), so it's ready when the TV
+  // next refreshes.
+  (ch.refreshing || Promise.resolve())
+    .catch(() => {}) // that refresh's own caller reports its failure
+    .then(() => refreshChannel(id, stream))
+    .catch((err) => recordError(id, stream, err.message));
+  sendJson(res, 200, channelState(stream));
+}
+
+function channelState(stream) {
+  const ch = stream.channel;
+  if (!ch || stream.sources.length < 2) return null; // one stream: nothing to swap
+  return { active: ch.active, labels: stream.sources.map((s) => s.label), switch: ch.switch };
+}
+
+// What the cast page says about the reserve: the amount in use, or why there is none.
+function reserveState(stream) {
+  if (stream.channel) return { seconds: stream.channel.reserveSeconds ?? HOLD_SECONDS, measured: stream.channel.reserveSeconds != null };
+  return { seconds: 0, why: stream.noReserveWhy || 'not set up' };
+}
+
+function recordRequest(stream, entry) {
+  stream.stats.requests++;
+  stream.stats.lastRequestAt = new Date().toISOString();
+  stream.stats.recent.push({ at: stream.stats.lastRequestAt, ...entry });
+  stream.stats.recent.splice(0, stream.stats.recent.length - 30);
 }
 
 const isLoopback = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
@@ -254,9 +526,11 @@ async function jobResult(req, res, stream, jobId) {
 const castInfo = (id, s) => ({
   id,
   url: s.url,
-  mediaUrl: LAN_BASE + relayPath(id, s.url),
+  mediaUrl: LAN_BASE + (s.channel ? `/s/${id}/live.m3u8` : relayPath(id, s.url)),
   castPageUrl: `http://localhost:${PORT}/cast/${id}`,
   info: s.info,
+  channel: channelState(s),
+  reserve: reserveState(s),
 });
 
 async function handle(req, res) {
@@ -280,7 +554,15 @@ async function handle(req, res) {
     } catch (err) {
       return sendJson(res, 400, { error: `bad JSON: ${err.message}` });
     }
-    if (!/^https?:\/\//.test(body.url || '')) return sendJson(res, 400, { error: 'url must be http(s)' });
+    // { url } for one stream, or { sources: [{ url, label }, …] } for Swap on TV (two streams).
+    const sources = body.sources ?? [{ url: body.url, label: body.url }];
+    if (!Array.isArray(sources) || sources.length < 1 || sources.length > 2) {
+      return sendJson(res, 400, { error: 'sources must list one or two streams' });
+    }
+    for (const s of sources) {
+      if (!/^https?:\/\//.test(s?.url || '')) return sendJson(res, 400, { error: `stream url must be http(s): ${JSON.stringify(s?.url)}` });
+      if (typeof s.label !== 'string' || !s.label) return sendJson(res, 400, { error: `stream ${s.url} needs a label` });
+    }
     // One stream at a time: retire the others so their player tabs stop polling (each held
     // poll is one of Chrome's 6 connections to localhost:PORT).
     for (const [oldId, old] of streams) {
@@ -292,8 +574,10 @@ async function handle(req, res) {
     const id = crypto.randomBytes(6).toString('hex');
     streams.set(id, {
       superseded: false,
-      url: body.url,
-      hosts: new Set([new URL(body.url).host]),
+      url: sources[0].url,
+      sources: sources.map((s) => ({ url: s.url, label: s.label, mediaUrl: null })),
+      channel: newChannel(), // one stream too: it gets the reserve, unless it turns out not to fit (see probe)
+      hosts: new Set(sources.map((s) => new URL(s.url).host)),
       info: null,
       stats: { requests: 0, lastRequestAt: null, errors: [], recent: [] },
       queue: [],
@@ -301,7 +585,8 @@ async function handle(req, res) {
       pending: new Map(),
       bridgeSeenAt: null,
     });
-    console.log(`[relay] ${id}: registered ${body.url}; waiting for the player tab to probe it`);
+    const what = sources.length > 1 ? `a Swap on TV channel: ${sources.map((s) => `"${s.label}"`).join(' and ')}` : sources[0].url;
+    console.log(`[relay] ${id}: registered ${what}; waiting for the player tab to probe it`);
     return sendJson(res, 200, { id });
   }
 
@@ -321,12 +606,25 @@ async function handle(req, res) {
     if (req.method === 'GET' && action === 'next') return nextJob(req, res, s);
     if (req.method === 'POST' && action === 'result' && jobId) return jobResult(req, res, s, jobId);
     if (req.method === 'POST' && action === 'probe') {
-      const result = await probe(id, s);
-      if (result.error) return sendJson(res, 502, { error: result.error });
+      let result = await (s.channel ? probeChannel(id, s) : probe(id, s));
+      if (result.error && s.sources.length === 1 && s.channel) {
+        // One stream that can't be relisted with a reserve (on-demand, fMP4, separate audio,
+        // encrypted…): pass its playlists through as they are, and say so.
+        s.channel = null;
+        s.noReserveWhy = `this stream ${result.why || result.error}`;
+        console.log(`[relay] ${id}: no reserve for this stream (${s.noReserveWhy}); passing its playlists through unchanged`);
+        result = await probe(id, s);
+      }
+      if (result.error) {
+        recordError(id, s, result.error);
+        return sendJson(res, 502, { error: result.error });
+      }
       s.info = result.info;
-      console.log(`[relay] ${id}: probe ok (${result.info.live ? 'live' : 'VOD'}, ${result.info.segmentFormat})`);
+      const mode = !s.channel ? 'playlists passed through, no reserve' : s.sources.length > 1 ? 'Swap on TV channel' : 'relisted with a reserve';
+      console.log(`[relay] ${id}: probe ok (${result.info.live ? 'live' : 'VOD'}, ${result.info.segmentFormat}, ${mode})`);
       return sendJson(res, 200, castInfo(id, s));
     }
+    if (req.method === 'POST' && action === 'switch') return switchChannel(id, s, res);
     return sendJson(res, 404, { error: 'not found' });
   }
 
@@ -337,9 +635,19 @@ async function handle(req, res) {
     return send(res, 200, fs.readFileSync(CAST_HTML_PATH, 'utf8'), { 'content-type': 'text/html; charset=utf-8' });
   }
 
-  if (parts[0] === 's' && parts[2] === 'r' && parts[3]) {
+  if (parts[0] === 's' && parts[2] === 'live.m3u8' && parts.length === 3) {
     if (!stream?.info) return send(res, 404, 'unknown stream (the relay may have restarted)');
     if (stream.superseded) return send(res, 410, SUPERSEDED);
+    if (!stream.channel) return send(res, 404, 'this cast has one stream; its playlist is at the media URL the cast page shows');
+    return serveChannel(parts[1], stream, res);
+  }
+
+  const srcMatch = parts[0] === 's' && parts[2]?.match(/^r(\d*)$/);
+  if (srcMatch && parts[3]) {
+    if (!stream?.info) return send(res, 404, 'unknown stream (the relay may have restarted)');
+    if (stream.superseded) return send(res, 410, SUPERSEDED);
+    const src = Number(srcMatch[1] || 0);
+    if (src >= stream.sources.length) return send(res, 404, `this cast has no stream ${src + 1}`);
     let upstream;
     try {
       upstream = unb64(parts[3]);
@@ -350,26 +658,54 @@ async function handle(req, res) {
     // Only fetch hosts this stream's own playlists pointed at, so the relay can't be used
     // as an open proxy by anything else on the network.
     if (!stream.hosts.has(new URL(upstream).host)) return send(res, 403, 'host not part of this stream');
-    stream.stats.requests++;
-    stream.stats.lastRequestAt = new Date().toISOString();
     const started = Date.now();
-    const r = await fetchUpstream(parts[1], stream, upstream);
+    const r = await cachedFetch(parts[1], stream, upstream, src);
     // Per-request timing: shows whether the TV is starved (slow fetches) or fed junk.
-    stream.stats.recent.push({
-      at: new Date().toISOString(),
+    recordRequest(stream, {
       file: new URL(upstream).pathname.split('/').pop(),
+      src,
       status: r.error ? r.status : 200,
       bytes: r.body?.length ?? 0,
       ms: Date.now() - started,
       type: r.type,
       head: r.body && !r.isPlaylist ? r.body.subarray(0, 8).toString('hex') : undefined,
     });
-    stream.stats.recent.splice(0, stream.stats.recent.length - 30);
     if (r.error) return send(res, r.status, r.error, { 'content-type': 'text/plain' });
+    if (!r.isPlaylist) {
+      // Whether the TV actually took the whole segment, and how long that took over the network.
+      const name = new URL(upstream).pathname.split('/').pop().slice(0, 16);
+      const sentAt = Date.now();
+      res.on('close', () => {
+        const ms = Date.now() - sentAt;
+        if (res.writableFinished) console.log(`[relay] ${parts[1]}: sent ${name} (${r.body.length} B) to the TV in ${ms} ms`);
+        else console.error(`[relay] ${parts[1]}: the TV hung up on ${name} after ${ms} ms, before it got all ${r.body.length} B`);
+      });
+    }
     return send(res, 200, r.body, { 'content-type': r.type });
   }
 
   send(res, 404, 'not found');
+}
+
+// The Chromecast asks for most segments twice, a few seconds apart. Without this, each ask
+// is another full download through the player tab, which doubles the load and starves the TV
+// on high-bitrate streams. Segments are kept briefly; playlists and failures never are.
+const SEGMENT_KEEP_MS = 30000;
+const segmentCache = new Map(); // upstream URL -> { promise, at }
+function cachedFetch(id, stream, upstream, src) {
+  const now = Date.now();
+  for (const [url, e] of segmentCache) if (now - e.at > SEGMENT_KEEP_MS) segmentCache.delete(url);
+  const hit = segmentCache.get(upstream);
+  if (hit) return hit.promise;
+  const promise = fetchUpstream(id, stream, upstream, src).then((r) => {
+    if (r.error || r.isPlaylist) segmentCache.delete(upstream);
+    return r;
+  }, (err) => {
+    segmentCache.delete(upstream);
+    throw err;
+  });
+  segmentCache.set(upstream, { promise, at: now });
+  return promise;
 }
 
 const server = http.createServer((req, res) => {
@@ -387,6 +723,8 @@ server.on('error', (err) => {
 server.listen(PORT, '::', async () => {
   console.log(`[relay] listening on port ${PORT}`);
   console.log(`[relay] TV-facing address: ${LAN_BASE}${process.env.RELAY_HOST ? ' (from RELAY_HOST)' : ' (auto-detected; set RELAY_HOST to override)'}`);
+  if (process.env.RELAY_CHANNEL_WINDOW) console.log(`[relay] Swap on TV lists ${CHANNEL_WINDOW} segments to the TV (from RELAY_CHANNEL_WINDOW; default 12)`);
+  if (process.env.RELAY_HOLD_SECONDS) console.log(`[relay] keeps ${HOLD_SECONDS} s of each live stream in reserve (from RELAY_HOLD_SECONDS; default 12)`);
   // Another process bound to just 127.0.0.1 on this port would quietly win "localhost"
   // requests from the extension. Make sure every address we rely on reaches us.
   for (const base of [`http://127.0.0.1:${PORT}`, `http://[::1]:${PORT}`, LAN_BASE]) {

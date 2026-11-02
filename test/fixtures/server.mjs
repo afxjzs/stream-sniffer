@@ -110,7 +110,10 @@ const DISGUISES = {
   gif: ['image/gif', disguiseAsGif],
 };
 
-export function startServers({ streamDir, hlsJsPath }) {
+export const LIVE_A_URL = `${CDN}/live/a/master.m3u8?token=${TOKEN}`;
+export const LIVE_B_URL = `${CDN}/live/b/master.m3u8?token=${TOKEN}`;
+
+export function startServers({ streamDir, streamDirB, hlsJsPath }) {
   const site = http.createServer((req, res) => {
     if (req.url.startsWith('/second')) {
       res.writeHead(200, { 'content-type': 'text/html' });
@@ -123,7 +126,7 @@ export function startServers({ streamDir, hlsJsPath }) {
   hls.attachMedia(document.getElementById('v'));
 </script>`);
     }
-    const embedPath = req.url.startsWith('/tricky') ? '/embed?tricky=1' : '/embed';
+    const embedPath = req.url.startsWith('/tricky') ? '/embed?tricky=1' : req.url.startsWith('/two-live') ? '/embed?two=1' : '/embed';
     res.writeHead(200, { 'content-type': 'text/html' });
     res.end(`<!doctype html><title>Fake Sports Site</title>
 <h1>Big Game</h1>
@@ -146,6 +149,21 @@ self.addEventListener('fetch', (e) => {
 });`);
     }
     const tricky = req.url.includes('tricky=1');
+    if (req.url.includes('two=1')) {
+      // Two live games on one page, like a site that shows a game and a whip-around channel.
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end(`<!doctype html><title>embed</title>
+<video id="a" autoplay muted playsinline width="320"></video>
+<video id="b" autoplay muted playsinline width="320"></video>
+<script src="/hls.min.js"></script>
+<script>
+  for (const [id, url] of [['a', ${JSON.stringify(LIVE_A_URL)}], ['b', ${JSON.stringify(LIVE_B_URL)}]]) {
+    const hls = new Hls();
+    hls.loadSource(url);
+    hls.attachMedia(document.getElementById(id));
+  }
+</script>`);
+    }
     res.writeHead(200, { 'content-type': 'text/html' });
     res.end(`<!doctype html><title>embed</title>
 <video id="v" autoplay muted playsinline width="640"></video>
@@ -169,6 +187,7 @@ self.addEventListener('fetch', (e) => {
   const liveStart = {}; // per live stream: when it was first requested
   let rotation = 0;
   let flakyRefreshes = 0;
+  const stall = { until: 0, edge: 0 }; // /live/stall/: while Date.now() < until, the edge stays put
   // allowed: the Referer prefix and CORS origin this CDN accepts.
   const makeCdn = (base, allowed) => http.createServer((req, res) => {
     const url = new URL(req.url, base);
@@ -186,25 +205,41 @@ self.addEventListener('fetch', (e) => {
     // /live/rot/: segment paths get a new prefix on every refresh, as some CDNs do with rotating
     // tokens. The segment itself doesn't change.
     // /live/flaky/: the third playlist refresh fails with a 503, as a CDN whose backend blips.
-    const live = url.pathname.match(/^\/live\/(rot|flaky)\/index\.m3u8$/);
+    // /live/a/ and /live/b/: plain live streams with different pictures (b is streamDirB).
+    // /live/stall/: like a, with a 6-segment window, and its server can stop adding segments for
+    // a while (stallLive below), as a real stream's source sometimes does; then it catches up.
+    const live = url.pathname.match(/^\/live\/(rot|flaky|a|b|stall)\/index\.m3u8$/);
     if (live) {
       if (live[1] === 'flaky' && ++flakyRefreshes === 3) {
         res.writeHead(503, { ...headers, 'content-type': 'text/plain' });
         return res.end('Backend fetch failed');
       }
       liveStart[live[1]] ??= Date.now();
-      const edge = Math.floor((Date.now() - liveStart[live[1]]) / 2000) + 2;
-      const first = Math.max(0, edge - 2);
+      let edge = Math.floor((Date.now() - liveStart[live[1]]) / 2000) + (live[1] === 'stall' ? 5 : 2);
+      if (live[1] === 'stall') {
+        if (Date.now() < stall.until) edge = stall.edge;
+        else stall.edge = edge;
+      }
+      const first = Math.max(0, edge - (live[1] === 'stall' ? 5 : 2));
       const prefix = live[1] === 'rot' ? `p${++rotation}` : 'p0';
+      // The 20 s of video loops, and its timestamps restart with it, so each loop is marked as a
+      // discontinuity, as a real playlist would. Only a, b, and stall run long enough to loop.
+      const loops = ['a', 'b', 'stall'].includes(live[1]);
+      const looped = (sn) => loops && sn > 0 && sn % 10 === 0;
       let body = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:${first}\n`;
-      for (let sn = first; sn <= edge; sn++) body += `#EXTINF:2.000,\n${prefix}/seg${sn % 10}.ts?token=${TOKEN}\n`;
+      if (loops) body += `#EXT-X-DISCONTINUITY-SEQUENCE:${Math.floor(first / 10)}\n`;
+      for (let sn = first; sn <= edge; sn++) {
+        // The first segment's own loop is already counted in DISCONTINUITY-SEQUENCE.
+        if (looped(sn) && sn !== first) body += '#EXT-X-DISCONTINUITY\n';
+        body += `#EXTINF:2.000,\n${prefix}/seg${sn % 10}.ts?token=${TOKEN}\n`;
+      }
       res.writeHead(200, { ...headers, 'content-type': 'application/vnd.apple.mpegurl' });
       return res.end(body);
     }
-    const rotSeg = url.pathname.match(/^\/live\/(?:rot|flaky)\/p\d+\/(seg\d+\.ts)$/);
+    const rotSeg = url.pathname.match(/^\/live\/(rot|flaky|a|b|stall)\/p\d+\/(seg\d+\.ts)$/);
     if (rotSeg) {
       res.writeHead(200, { ...headers, 'content-type': 'video/mp2t' });
-      return res.end(fs.readFileSync(path.join(streamDir, rotSeg[1])));
+      return res.end(fs.readFileSync(path.join(rotSeg[1] === 'b' ? streamDirB : streamDir, rotSeg[2])));
     }
     // /live/broken/: the variant playlist comes back as an HTML error page, as a flaky live CDN
     // sometimes does.
@@ -212,7 +247,7 @@ self.addEventListener('fetch', (e) => {
       res.writeHead(200, { ...headers, 'content-type': 'text/html' });
       return res.end('<html><body><h1>503 Service Unavailable</h1></body></html>');
     }
-    if (/^\/live\/((png|webp|gif|broken|rot|flaky)\/)?master\.m3u8$/.test(url.pathname)) {
+    if (/^\/live\/((png|webp|gif|broken|rot|flaky|a|b|stall)\/)?master\.m3u8$/.test(url.pathname)) {
       res.writeHead(200, { ...headers, 'content-type': 'application/vnd.apple.mpegurl' });
       return res.end(
         `#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=320x240\nindex.m3u8?token=${TOKEN}\n`
@@ -260,6 +295,10 @@ self.addEventListener('fetch', (e) => {
   ).then(() => ({
     rejected,
     served,
+    // Stops /live/stall/ from adding segments for ms milliseconds.
+    stallLive: (ms) => {
+      stall.until = Date.now() + ms;
+    },
     // closeAllConnections: keep-alive sockets (from fetch and the relay) would otherwise hold
     // close() open forever.
     close: () =>
