@@ -34,23 +34,31 @@ function assert(cond, msg) {
   ok(msg);
 }
 
-// Two streams with different pictures, so a test can tell which one reached the TV.
+// The test video; a second stream with a different picture (streamDirB), so a test can tell
+// which one reached the TV; a 1280x720 copy (hi/) for the stream with two quality levels; and a
+// copy with uneven frame timestamps (jitter/): every fourth frame 0.45 of a frame late, as
+// relayed re-streams often have.
 function ensureStreams() {
-  ensureStream(streamDir, 'testsrc', 440);
-  ensureStream(streamDirB, 'testsrc2', 880);
+  makeStream(streamDir, '320x240');
+  makeStream(streamDirB, '320x240', [], { pattern: 'testsrc2', tone: 880 });
+  makeStream(path.join(streamDir, 'hi'), '1280x720');
+  makeStream(path.join(streamDir, 'jitter'), '320x240', [
+    '-vf', "settb=1/90000,setpts='(N+if(eq(mod(N\\,4)\\,1)\\,0.45\\,0))/25/TB'",
+    '-fps_mode', 'passthrough', '-enc_time_base', '1/90000', '-bf', '0',
+  ]);
 }
-
-function ensureStream(dir, pattern, tone) {
+function makeStream(dir, size, videoArgs = [], { pattern = 'testsrc', tone = 440 } = {}) {
   if (fs.existsSync(path.join(dir, 'index.m3u8'))) return;
-  step(`Generating test HLS stream in ${path.basename(dir)} with ffmpeg`);
+  step(`Generating ${size} test HLS stream in ${path.relative(path.dirname(streamDir), dir)} with ffmpeg`);
   fs.mkdirSync(dir, { recursive: true });
   const r = spawnSync(
     'ffmpeg',
     [
       '-y', '-loglevel', 'error',
-      '-f', 'lavfi', '-i', `${pattern}=size=320x240:rate=25`,
+      '-f', 'lavfi', '-i', `${pattern}=size=${size}:rate=25`,
       '-f', 'lavfi', '-i', `sine=frequency=${tone}`,
       '-t', '20',
+      ...videoArgs,
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-g', '50',
       '-c:a', 'aac',
       '-f', 'hls', '-hls_time', '2', '-hls_playlist_type', 'vod',
@@ -99,6 +107,21 @@ async function waitForText(page, re, timeoutMs = 10000) {
     re.flags
   );
   return handle.jsonValue();
+}
+
+// Reports a fatal network error on the page's big stream, as hls.js does once its own retries
+// of a segment give up.
+const failSegment = (page) =>
+  page.evaluate(() =>
+    streams[0].hls.trigger(Hls.Events.ERROR, { type: Hls.ErrorTypes.NETWORK_ERROR, details: Hls.ErrorDetails.FRAG_LOAD_ERROR, fatal: true })
+  );
+
+// Clicks Start casting in the player's menu (opening the menu if it's closed).
+async function startCasting(page) {
+  // Clicks wait for the page to draw a frame, which a background tab doesn't.
+  await page.bringToFront();
+  if (await page.$eval('#menu', (m) => m.hidden)) await page.click('::-p-aria(Settings)');
+  await page.click('button::-p-text(Start casting)');
 }
 
 // Starts the relay the way a user would (`node relay/server.mjs`) and waits for its "ready"
@@ -185,13 +208,27 @@ async function main() {
     const popup = await popupTarget.asPage();
     await popup.waitForSelector('::-p-text(master.m3u8)', { timeout: 5000 });
     ok('popup lists master.m3u8');
-    await popup.screenshot({ path: path.join(artifactsDir, 'popup.png') });
 
+    step('The popup says what each playlist offers; "Check quality" measures it');
+    // The fixture master lists one quality (320x240, 400 kbps), whose playlist is a finished video.
+    const rejectedBefore = servers.rejected.length;
+    const masterInfo = await waitForText(popup, /^1 quality: 240p · 400 kbps advertised · not live$/, 10000);
+    ok(`master playlist: "${masterInfo}"`);
     let masterItem = null;
     for (const li of await popup.$$('li')) {
       if ((await li.evaluate((el) => el.textContent)).includes('live/master.m3u8')) masterItem = li;
     }
     assert(masterItem, 'popup has a list entry for master.m3u8');
+    await (await masterItem.$('button::-p-text(Check quality)')).click();
+    const checked = await waitForText(popup, /^(Checked|Couldn't check)/, 30000);
+    assert(/^Checked: 240p25 · \d+ kbps measured$/.test(checked), `check reports resolution, frame rate and measured bitrate ("${checked}")`);
+    assert(servers.rejected.length === rejectedBefore, `the CDN accepted the popup's requests (${JSON.stringify(servers.rejected.slice(rejectedBefore))})`);
+    const popupRules = await sw.evaluate(async () =>
+      (await chrome.declarativeNetRequest.getSessionRules()).filter((r) => r.condition.tabIds?.includes(chrome.tabs.TAB_ID_NONE)).length
+    );
+    assert(popupRules === 0, `the popup's header rules are gone once it's done (${popupRules} left)`);
+    await popup.screenshot({ path: path.join(artifactsDir, 'popup.png') });
+
     const popupText = await popup.$eval('body', (b) => b.innerText);
     assert(
       !popupText.includes('http-referrer') && !popupText.includes(MASTER_URL),
@@ -259,14 +296,25 @@ async function main() {
     });
     assert(fills, 'video covers the whole tab');
     await player.click('::-p-aria(Settings)');
-    await player.waitForSelector('button::-p-text(Pop out)', { visible: true, timeout: 5000 });
-    ok('the settings button opens the menu');
+    await player.waitForSelector('input[name=url]', { visible: true, timeout: 5000 });
+    ok('settings menu shows the stream form');
+    await player.click('#play-url summary');
+    // Puppeteer's { hidden: true } doesn't see inside a closed <details>; checkVisibility does.
+    await player.waitForFunction(() => !document.querySelector('input[name=url]').checkVisibility(), { timeout: 5000 });
+    ok('"Play a URL" folds away');
+    await player.reload();
+    await waitForPlayback(player, 'extension player after a reload', 0.5);
+    await player.click('::-p-aria(Settings)');
+    assert(await player.$eval('#play-url', (d) => !d.open), '"Play a URL" is still folded after a reload');
+    await player.click('#play-url summary');
+    await player.waitForSelector('input[name=url]', { visible: true, timeout: 5000 });
+    ok('and opens again with a click');
 
     step('"Pop out" puts the video in a floating picture-in-picture window, and can bring it back');
-    await player.click('button::-p-text(Pop out)');
+    await player.click('::-p-aria(Pop out)');
     await player.waitForFunction(() => document.pictureInPictureElement?.tagName === 'VIDEO', { timeout: 5000 });
     ok('video is in picture-in-picture');
-    await player.click('button::-p-text(Back to tab)');
+    await player.click('::-p-aria(Back to tab)');
     await player.waitForFunction(() => !document.pictureInPictureElement, { timeout: 5000 });
     ok('video is back in the tab');
     await player.click('::-p-aria(Settings)'); // close the menu
@@ -306,6 +354,32 @@ async function main() {
     await bigEl.click(); // bigEl is the small one now
     [a, b] = await sizes();
     assert(a.area > b.area * 4, 'clicking again swaps back');
+    await player.keyboard.press('s');
+    [a, b] = await sizes();
+    assert(b.area > a.area * 4 && !b.muted && a.muted, 'S swaps them too, sound included');
+    await player.keyboard.press('s');
+    [a, b] = await sizes();
+    assert(a.area > b.area * 4, 'and S again swaps back');
+
+    // Hiding the small picture keeps its stream playing, and S still swaps.
+    const smallState = () =>
+      player.$eval('video.small', (v) => ({ shown: v.checkVisibility({ visibilityProperty: true }), t: v.currentTime, muted: v.muted }));
+    const bigSrc = await player.$eval('video.big', (v) => v.src);
+    await player.click('::-p-aria(Hide the small picture)');
+    const tucked = await smallState();
+    assert(!tucked.shown, 'the – on the small picture hides it');
+    await player.waitForFunction((t) => document.querySelector('video.small').currentTime >= t + 1, { timeout: 5000, polling: 250 }, tucked.t);
+    ok('its stream keeps playing while hidden');
+    await player.keyboard.press('s');
+    assert((await player.$eval('video.big', (v) => v.src)) !== bigSrc, 'S still swaps while it is hidden');
+    assert(!(await smallState()).shown && (await smallState()).muted, 'and the stream swapped out is the hidden, muted one');
+    await player.keyboard.press('s');
+    await player.click('::-p-aria(Show small picture)');
+    assert((await smallState()).shown, '"Show small picture" in the bar brings it back');
+    await player.keyboard.press('h');
+    assert(!(await smallState()).shown, 'H hides it');
+    await player.keyboard.press('h');
+    assert((await smallState()).shown, 'and H shows it again');
 
     const smallRect = () =>
       player.$$eval('video', (vs) => {
@@ -353,6 +427,37 @@ async function main() {
     );
     assert(servers.rejected.length === 0, `both CDNs still accepted every request (${JSON.stringify(servers.rejected)})`);
     await player.screenshot({ path: path.join(artifactsDir, 'player-two-streams.png') });
+
+    // The test video is 320x240 at 25 fps. The frame rate takes 2 s of video to count.
+    const barLabel = await player
+      .waitForFunction(
+        () => {
+          const text = document.getElementById('quality').textContent;
+          return /^240p25·?\d+(\.\d)? (Mbps|kbps)$/.test(text) && text;
+        },
+        { timeout: 10000, polling: 250 }
+      )
+      .then((h) => h.jsonValue())
+      .catch(async (err) => {
+        throw new Error(`bar label is "${await player.$eval('#quality', (e) => e.textContent)}": ${err.message}`);
+      });
+    ok(`the bar shows the big picture's resolution, frame rate and measured bitrate ("${barLabel}")`);
+    const bothShowing = () => player.$$eval('video', (vs) => vs.filter((v) => !v.hidden && v.checkVisibility()).length === 2);
+    await player.click('::-p-aria(Full screen)');
+    await player.waitForFunction(() => document.fullscreenElement === document.documentElement, { timeout: 5000 });
+    assert(await bothShowing(), 'the full-screen button fills the screen with the whole player, so the small picture stays');
+    await player.keyboard.press('f');
+    await player.waitForFunction(() => !document.fullscreenElement, { timeout: 5000 });
+    ok('F leaves full screen');
+    await (await player.$('video.big')).click({ count: 2 });
+    await player.waitForFunction(() => document.fullscreenElement === document.documentElement, { timeout: 5000 });
+    assert(await bothShowing(), 'double-clicking the big picture does the same');
+    await player.keyboard.press('f');
+    await player.waitForFunction(() => !document.fullscreenElement, { timeout: 5000 });
+    await player.click('::-p-aria(Mute)');
+    assert(await player.$eval('video.big', (v) => v.muted), "the bar's speaker button mutes the big picture");
+    await player.keyboard.press('m');
+    assert(!(await player.$eval('video.big', (v) => v.muted)), 'and M unmutes it');
     await player.click('::-p-aria(Settings)');
     await player.screenshot({ path: path.join(artifactsDir, 'player-menu.png') });
     await player.click('::-p-aria(Settings)'); // close the menu
@@ -375,14 +480,20 @@ async function main() {
     assert((await visible()) === 1, 'it stays removed after a reload');
     await player.click('::-p-aria(Settings)');
 
-    step('"Cast via relay" without the relay running says how to start it');
-    await player.click('button::-p-text(Cast via relay)');
+    step('"Cast via relay" stays in view with "Play a URL" folded; without the relay running it says how to start it');
+    if (await player.$eval('#play-url', (d) => d.open)) await player.click('#play-url summary');
+    await player.waitForFunction(() => !document.querySelector('input[name=url]').checkVisibility(), { timeout: 5000 });
+    assert(
+      await player.$eval('#relay', (b) => b.checkVisibility() && b.textContent === 'Start casting'),
+      'Start casting shows in the menu while "Play a URL" is folded'
+    );
+    await startCasting(player);
     const noRelayMsg = await waitForText(player, /^Relay:.*relay\/server\.mjs/);
     ok(`player reports: "${noRelayMsg}"`);
 
     step('Start the relay; "Cast via relay" shows the cast controls inside the player, with a LAN address for the TV');
     relay = await startRelay();
-    await player.click('button::-p-text(Cast via relay)');
+    await startCasting(player);
     const castFrame = await player.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
     const mediaText = await waitForText(castFrame, /http:\/\/[\d.]+:8789\/\S+/);
     const mediaUrl = mediaText.match(/http:\/\/[\d.]+:8789\/\S+/)[0];
@@ -437,7 +548,7 @@ async function main() {
     await waitForPlayback(trickyPlayer, 'extension player on PNG-disguised stream');
     ok('extension player plays the PNG-disguised stream');
     await trickyPlayer.click('::-p-aria(Settings)');
-    await trickyPlayer.click('button::-p-text(Cast via relay)');
+    await startCasting(trickyPlayer);
     const trickyFrame = await trickyPlayer.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
     const trickyMedia = (await waitForText(trickyFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
     const tMaster = await (await fetch(trickyMedia)).text();
@@ -460,7 +571,7 @@ async function main() {
     await webp.click('button::-p-text(Play)');
     await waitForPlayback(webp, 'extension player on WebP-disguised stream');
     ok('extension player plays the WebP-disguised stream');
-    await webp.click('button::-p-text(Cast via relay)');
+    await startCasting(webp);
     const webpFrame = await webp.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
     const webpMedia = (await waitForText(webpFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
     const wVariantUrl = new URL(firstUri(await (await fetch(webpMedia)).text()), webpMedia).href;
@@ -480,7 +591,7 @@ async function main() {
     await gif.type('input[name=url]', GIF_MASTER_URL);
     await gif.type('input[name=referer]', EMBED + '/');
     await gif.click('button::-p-text(Play)');
-    await gif.click('button::-p-text(Cast via relay)');
+    await startCasting(gif);
     const gifMsg = await waitForText(gif, /^Relay:.*image/i, 15000);
     ok(`player reports: "${gifMsg}"`);
     const gifFrames = gif.frames().filter((f) => f.url().startsWith(`${RELAY}/cast/`));
@@ -620,7 +731,7 @@ async function main() {
     ok('the player plays live stream A big and live stream B small');
 
     await ch.click('::-p-aria(Settings)');
-    await ch.click('button::-p-text(Cast via relay)');
+    await startCasting(ch);
     const chFrame = await ch.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 15000 });
     const chMedia = (await waitForText(chFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
     const playing = await ch.$$eval('video', (vs) => vs.filter((v) => !v.hidden && !v.paused).length);
@@ -666,7 +777,7 @@ async function main() {
     await steady.click('button::-p-text(Play)');
     await waitForPlayback(steady, 'player on the pausing live stream');
     // Manual mode leaves the ⚙ menu open (it holds the URL form), so the relay button is in view.
-    await steady.click('button::-p-text(Cast via relay)');
+    await startCasting(steady);
     const steadyFrame = await steady.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 15000 });
     let steadyMedia = (await waitForText(steadyFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
     // Like the TV, follow a master playlist to the variant it plays.
@@ -719,24 +830,122 @@ async function main() {
     const manualTime = await waitForPlayback(manual, 'manual player');
     ok(`manual mode plays (t=${manualTime.toFixed(1)}s)`);
 
-    step('A playlist the server garbles shows why it failed and what the server sent');
+    step('Frames missing from the stream show as a warning, and in the menu');
+    // A gap in the video's timeline, as countFrames records one when frames never arrive.
+    await manual.evaluate(() => (streams[0].gapFrames += 5));
+    const framesMsg = await waitForText(manual, /Frames in the last 10 s: .*\d+ missing from the stream itself/, 5000);
+    ok(`over the video: "${framesMsg.slice(0, 120)}"`);
+    await manual.click('summary::-p-text(Details)');
+    const framesTotal = await waitForText(manual, /Frames so far: \d+ skipped by Chrome's video player, \d+ missing from the stream/, 5000);
+    ok(`in the menu's details: "${framesTotal}"`);
+    const framesShowing = () => manual.$eval('#problems', (e) => /Frames in the last 10 s/.test(e.textContent));
+    await manual.click('#frame-warnings'); // the menu's switch: off
+    await manual.waitForFunction(() => !/Frames in the last 10 s/.test(document.getElementById('problems').textContent), { timeout: 3000 });
+    ok('the menu switch turns the warning off');
+    await manual.click('#frame-warnings'); // and back on
+    await manual.waitForFunction(() => /Frames in the last 10 s/.test(document.getElementById('problems').textContent), { timeout: 3000 });
+    assert(await framesShowing(), 'and on again');
+
+    step("An older message doesn't stop the automatic retries; Retry pressed twice starts the stream once");
+    await manual.evaluate(() => (streams[0].error = 'An older, unrelated message'));
+    await failSegment(manual);
+    await waitForText(manual, /Retrying in \d+ s \(try 1 of 3\)/, 5000);
+    ok('the retry countdown starts anyway');
+    const manualTab = await manual.evaluate(async () => (await chrome.tabs.getCurrent()).id);
+    const oldId = await manual.evaluate(() => streams[0].id);
+    // Retry over the video and Retry in the menu, at once.
+    await manual.evaluate(() => {
+      document.querySelector('#problems .retry').click();
+      document.querySelector('#streams .retry').click();
+    });
+    await manual.waitForFunction((id) => streams[0].id !== id && streams[0].video.currentTime > 1, { timeout: 15000 }, oldId);
+    const tabRules = await sw.evaluate(
+      async (id) => (await chrome.declarativeNetRequest.getSessionRules()).filter((r) => r.condition.tabIds?.includes(id)).length,
+      manualTab
+    );
+    assert(tabRules === 1, `it plays again as one stream (header rules for the tab: ${tabRules})`);
+
+    step('A stream with two quality levels says which one is on screen, and the menu can lock one');
+    const multi = await browser.newPage();
+    await multi.goto(`chrome-extension://${ext.id}/player.html`);
+    await multi.type('input[name=url]', MASTER_URL.replace('/live/', '/live/multi/'));
+    await multi.type('input[name=referer]', EMBED + '/');
+    await multi.click('button::-p-text(Play)');
+    await waitForPlayback(multi, 'two-level stream', 0.5);
+    const firstHeight = await multi.evaluate(() => streams[0].hls.levels[streams[0].firstLevel]?.height);
+    assert(firstHeight === 720, `it starts on the best quality (first segment: ${firstHeight}p)`);
+    const autoNote = await waitForText(multi, /(240|720)p, picked automatically from 2 quality levels/);
+    ok(`status names the quality on screen: "${autoNote.slice(0, 160)}"`);
+    await multi.click('::-p-aria(Settings)'); // close the menu, to see the bar
+    await multi.click('#quality');
+    await multi.screenshot({ path: path.join(artifactsDir, 'player-quality-menu.png') });
+    const options = await multi.$$eval('#quality-menu button', (bs) => bs.map((b) => b.textContent));
+    assert(
+      options.length === 3 && /^Auto/.test(options[0]) && /^720p/.test(options[1]) && /^240p/.test(options[2]),
+      `the bar's quality menu lists Auto, then highest first (${options.join(' | ')})`
+    );
+    await multi.click('#quality-menu button:nth-child(3)');
+    await multi.click('::-p-aria(Settings)'); // the menu's status says who picked it
+    await waitForText(multi, /240p, picked by you \(of 2 quality levels\)/, 15000);
+    ok('picking 240p switches to it and says it was picked by hand');
+    await multi.click('::-p-aria(Settings)');
+    await multi.click('#quality');
+    await multi.click('#quality-menu button:nth-child(2)');
+    await multi.click('::-p-aria(Settings)');
+    await waitForText(multi, /720p, picked by you \(of 2 quality levels\)/, 15000);
+    await multi.click('::-p-aria(Settings)');
+    await multi.waitForFunction(() => /^720p/.test(document.getElementById('resolution').textContent), { timeout: 5000 });
+    ok('the bar shows 720p');
+    const lockedT = await multi.evaluate(() => document.querySelector('video').currentTime);
+    await waitForPlayback(multi, 'two-level stream after switching up', lockedT + 1, 10000);
+    ok('picking 720p switches up, and playback goes on');
+    const beforeDrop = await multi.evaluate(() => streams[0].id);
+    await failSegment(multi);
+    await multi.waitForFunction((id) => streams[0].id !== id && streams[0].video.currentTime > 1, { timeout: 20000 }, beforeDrop);
+    const kept = await multi.evaluate(() => ({ height: streams[0].hls.levels[streams[0].quality]?.height, auto: streams[0].hls.autoLevelEnabled }));
+    assert(kept.height === 720 && !kept.auto, `after a drop and a retry, it stays on the 720p picked by hand (${JSON.stringify(kept)})`);
+    await multi.close();
+
+    step('A stream with uneven frame timestamps is called out; the menu says how it is decoded');
+    const jitter = await browser.newPage();
+    await jitter.goto(`chrome-extension://${ext.id}/player.html`);
+    await jitter.type('input[name=url]', MASTER_URL.replace('/live/master.m3u8', '/live/jitter/index.m3u8'));
+    await jitter.type('input[name=referer]', EMBED + '/');
+    await jitter.click('button::-p-text(Play)');
+    await jitter.click('summary::-p-text(Details)');
+    const unevenNote = await waitForText(jitter, /Frame timing uneven: \d+% of frames off their beat/, 15000);
+    ok(`menu's details: "${unevenNote}"`);
+    const decodingNote = await waitForText(jitter, /H\.264, (hardware decoding available|no hardware decoding)/, 5000);
+    ok(`and how it's decoded: "${decodingNote}"`);
+    // The test video's even copy isn't called out.
+    assert(!(await manual.$eval('#streams', (e) => /frame timing uneven/i.test(e.textContent))), 'an even stream is not called out');
+    await jitter.close();
+
+    step('A playlist linked directly (no list of qualities) still shows the real resolution');
+    const direct = await browser.newPage();
+    await direct.goto(`chrome-extension://${ext.id}/player.html`);
+    await direct.type('input[name=url]', MASTER_URL.replace('master.m3u8', 'index.m3u8'));
+    await direct.type('input[name=referer]', EMBED + '/');
+    await direct.click('button::-p-text(Play)');
+    await waitForPlayback(direct, 'directly linked playlist', 0.5);
+    const directNote = await waitForText(direct, /240p, the only quality level/);
+    ok(`status reads the size off the video: "${directNote.slice(0, 160)}"`);
+    await direct.close();
+
+    step('A playlist the server garbles shows why it stopped and what the server sent, and is retried');
     const garbled = await browser.newPage();
     await garbled.goto(`chrome-extension://${ext.id}/player.html`);
     await garbled.type('input[name=url]', MASTER_URL.replace('/live/', '/live/broken/'));
     await garbled.type('input[name=referer]', EMBED + '/');
     await garbled.click('button::-p-text(Play)');
     // A garbled reply is retried like a failed load, so this takes a few seconds.
-    await garbled.waitForFunction(() => /Stopped/.test(document.getElementById('problems').textContent), {
-      timeout: 30000,
-      polling: 250,
-    });
-    const garbledShort = await garbled.$eval('#problems', (p) => p.textContent);
+    const garbledShort = await waitForText(garbled, /isn't a playlist\. Retrying in \d+ s \(try 1 of 3\)/, 30000);
     assert(
-      garbledShort.length < 120 && !/Buffering|Reconnecting/.test(garbledShort),
-      `over the video, one short line says it stopped ("${garbledShort}")`
+      !/EXTM3U|Buffering|Reconnecting/.test(garbledShort),
+      `over the video, one short line says it stopped and when it retries, without the technical detail ("${garbledShort}")`
     );
     await garbled.click('summary::-p-text(Details)');
-    const garbledMsg = await waitForText(garbled, /EXTM3U.*503 Service Unavailable/);
+    const garbledMsg = await waitForText(garbled, /isn't a playlist\. Retrying in \d+ s \(try 1 of 3\).*EXTM3U.*503 Service Unavailable/);
     ok(`the stream's details in the menu say what the server sent: "${garbledMsg}"`);
 
     step('A live stream whose segment URLs change on every refresh keeps playing, and the player says what it skipped');
@@ -752,6 +961,26 @@ async function main() {
     await rot.click('summary::-p-text(Details)');
     const rotNote = await waitForText(rot, /skipped \d+ playlist problems?.*media sequence mismatch/);
     ok(`the stream's details say: "${rotNote.slice(0, 160)}…"`);
+
+    step('A decoding error is recovered in place; a second one soon after restarts the stream');
+    // The error hls.js reports when the browser's decoder rejects video (a corrupt segment).
+    const decodeError = () =>
+      rot.evaluate(() => {
+        streams[0].hls.trigger(Hls.Events.ERROR, { type: Hls.ErrorTypes.MEDIA_ERROR, details: Hls.ErrorDetails.BUFFER_APPEND_ERROR, fatal: true });
+        return { id: streams[0].id, t: streams[0].video.currentTime };
+      });
+    const problemsShow = (page, re) =>
+      page.waitForFunction((src) => new RegExp(src).test(document.getElementById('problems').textContent), { timeout: 15000, polling: 'mutation' }, re.source);
+    const beforeDecode = await decodeError();
+    await problemsShow(rot, /decoder hit a problem.*recovering/);
+    ok('it says the decoder hit a problem and is recovering');
+    // Live: the playlist holds only a few seconds, so playing on needs new segments loaded.
+    await waitForPlayback(rot, 'live stream after decoder recovery', beforeDecode.t + 6, 20000);
+    assert((await rot.evaluate(() => streams[0].id)) === beforeDecode.id, 'and plays on, loading new segments, without reloading the stream');
+    await decodeError();
+    await problemsShow(rot, /couldn't be decoded.*Retrying in \d+ s \(try 1 of 3\)/);
+    ok('a second one within 30 s stops it, and the automatic retry takes over');
+    await rot.close();
 
     step('A playlist refresh that fails once shows while it is retried, then clears; a pause is undone');
     const flaky = await browser.newPage();
@@ -773,9 +1002,8 @@ async function main() {
     await waitForPlayback(flaky, 'flaky live stream after the retry', flakyT + 2);
     ok('it clears once the next refresh works, and playback goes on');
 
-    // Live streams just play: a pause, from the controls or the browser, is undone and noted.
-    await flaky.focus('video');
-    await flaky.keyboard.press('Space'); // the video's own pause key
+    // Live streams just play: a pause, from a media key or the browser, is undone and noted.
+    await flaky.evaluate(() => document.querySelector('video').pause());
     const pausedT = await flaky.evaluate(() => document.querySelector('video').currentTime);
     await waitForPlayback(flaky, 'flaky live stream after a pause', pausedT + 1, 5000);
     await flaky.click('::-p-aria(Settings)');
@@ -783,6 +1011,24 @@ async function main() {
     const resumeNote = await waitForText(flaky, /resumed after 1 pause/i);
     ok(`a pause is undone at once and noted in the status: "${resumeNote.slice(0, 160)}"`);
     await flaky.close();
+
+    step('A stream whose server stops answering is tried again by itself, and plays again');
+    const down = await browser.newPage();
+    const downLogs = [];
+    down.on('console', (m) => /retrying in/i.test(m.text()) && downLogs.push(m.text()));
+    await down.goto(`chrome-extension://${ext.id}/player.html`);
+    await down.type('input[name=url]', MASTER_URL.replace('/live/', '/live/down/'));
+    await down.type('input[name=referer]', EMBED + '/');
+    await down.click('button::-p-text(Play)');
+    const retryNote = await waitForText(down, /Retrying in 5 s \(try 1 of 3\)/, 15000);
+    ok(`it says so: "${retryNote.slice(0, 160)}"`);
+    await new Promise((r) => setTimeout(r, 2500)); // a few seconds of countdown
+    assert(downLogs.length === 1, `the countdown logs once, not every second (${downLogs.length} log lines)`);
+    await waitForPlayback(down, 'dropped stream after the automatic retry', 1, 20000);
+    ok('and plays once the server answers again');
+    const backNote = await waitForText(down, /Back after 1 automatic retry/, 5000);
+    ok(`and says it's back: "${backNote}"`);
+    await down.close();
 
     step('Manual mode without a Referer fails loudly, not silently');
     const bad = await browser.newPage();
@@ -792,9 +1038,67 @@ async function main() {
     await bad.waitForSelector('::-p-text(403)', { timeout: 10000 });
     ok('player shows the 403 error to the user');
     await bad.screenshot({ path: path.join(artifactsDir, 'player-403.png') });
+    const expiredMsg = await waitForText(bad, /probably expired/);
+    ok(`a refused link isn't retried by itself, and says why: "${expiredMsg.slice(-110)}"`);
+    const refusedSoFar = servers.rejected.length;
+    // Clicking a message copies it. (The test browser's clipboard is stubbed to see what was sent.)
+    await bad.evaluate(() => (navigator.clipboard.writeText = async (t) => void (window.copiedText = t)));
+    await bad.click('#problems p.error .text');
+    await bad.waitForSelector('#problems .copied', { timeout: 3000 });
+    const copied = await bad.evaluate(() => window.copiedText);
+    assert(/probably expired.*403/.test(copied), `clicking the message copies it, and says so ("${copied.slice(0, 60)}…")`);
+    await bad.click('#problems p.error .retry');
+    for (let i = 0; i < 50 && servers.rejected.length === refusedSoFar; i++) await new Promise((r) => setTimeout(r, 200));
+    assert(servers.rejected.length > refusedSoFar, 'Retry asks the server again (which refuses again: the link is bad)');
+    await bad.waitForSelector('#problems p.error .dismiss', { timeout: 10000 });
+    await bad.click('#problems p.error .dismiss');
+    await bad.waitForFunction(() => !/403/.test(document.getElementById('problems').textContent), { timeout: 5000 });
+    ok('the × on the error dismisses it');
+
+    step('"Reopen last player" in the popup brings back the streams the player showed last');
+    const lastSession = await sw.evaluate(async () => (await chrome.storage.session.get('lastSession')).lastSession);
+    const lastUrls = await sw.evaluate(async (ids) => Object.values(await chrome.storage.session.get(ids.map((id) => `cap:${id}`))).map((c) => c.url), lastSession);
+    await page.bringToFront();
+    await ext.triggerAction(page);
+    const reopenPopup = await (await browser.waitForTarget((t) => t.url().includes('/popup.html'), { timeout: 5000 })).asPage();
+    const openBefore = new Set(browser.targets());
+    const reopenedTarget = browser.waitForTarget((t) => !openBefore.has(t) && t.url().includes('/player.html?cap='), { timeout: 5000 });
+    await reopenPopup.click('::-p-text(Reopen last player)');
+    const reopened = await (await reopenedTarget).asPage();
+    assert(
+      JSON.stringify(new URL(reopened.url()).searchParams.getAll('cap')) === JSON.stringify(lastSession),
+      `it opens a player with the last session's ${lastSession.length} stream(s)`
+    );
+    await reopened.waitForFunction((url) => document.getElementById('streams').textContent.includes(url), { timeout: 5000 }, lastUrls[0]);
+    ok(`which loads them again (${lastUrls[0]})`);
+    await reopened.close();
+
+    step("A popup closed in the middle of a quality check leaves no header rule behind");
+    await page.bringToFront();
+    const targetsBefore = new Set(browser.targets()); // the last popup's target may linger
+    await ext.triggerAction(page);
+    const closingPopup = await (
+      await browser.waitForTarget((t) => !targetsBefore.has(t) && t.url().includes('/popup.html'), { timeout: 5000 })
+    ).asPage();
+    await closingPopup.waitForSelector('button::-p-text(Check quality)', { timeout: 5000 });
+    await closingPopup.click('button::-p-text(Check quality)');
+    const popupRuleCount = () =>
+      sw.evaluate(async () => (await chrome.declarativeNetRequest.getSessionRules()).filter((r) => r.condition.tabIds?.includes(chrome.tabs.TAB_ID_NONE)).length);
+    // Mid-check: its preview is playing (it waits its turn behind the popup's playlist reads).
+    await closingPopup.waitForSelector('.preview:not([hidden]) video', { timeout: 15000 });
+    assert((await popupRuleCount()) > 0, 'the check has its header rule');
+    await closingPopup.close();
+    for (let i = 0; i < 30 && (await popupRuleCount()) > 0; i++) await new Promise((r) => setTimeout(r, 100));
+    assert((await popupRuleCount()) === 0, 'closing the popup removes it');
+
+    step('The garbled playlist from earlier gives up after 3 automatic retries, and says so');
+    // Its retries (5 + 15 + 30 s) have been running behind the steps since.
+    const gaveUp = await waitForText(garbled, /^Stopped after 3 automatic retries: the server sent something that isn't a playlist\. Press Retry/, 60000);
+    ok(`"${gaveUp.slice(0, 110)}…"`);
+    assert(await garbled.$('#problems .retry'), 'with a Retry button');
 
     step('"Cast via relay" with headers the CDN rejects reports the 403 instead of casting a dead URL');
-    await bad.click('button::-p-text(Cast via relay)');
+    await startCasting(bad);
     const badRelayMsg = await waitForText(bad, /^Relay:.*403/);
     ok(`player reports: "${badRelayMsg}"`);
 
@@ -810,9 +1114,9 @@ async function main() {
 
 // A hang must fail loudly too, not leave the run sitting there.
 const watchdog = setTimeout(() => {
-  console.error('\nFAIL — test did not finish within 180s (hung)');
+  console.error('\nFAIL — test did not finish within 360s (hung)');
   process.exit(1);
-}, 180000);
+}, 360000);
 watchdog.unref();
 
 main().catch((err) => {

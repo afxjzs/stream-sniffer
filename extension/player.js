@@ -4,7 +4,11 @@ const streamsEl = document.getElementById('streams');
 const menu = document.getElementById('menu');
 const settingsBtn = document.getElementById('settings');
 const removeSmallBtn = document.getElementById('remove-small');
+const hideSmallBtn = document.getElementById('hide-small');
+const showSmallBtn = document.getElementById('show-small');
 const castStatus = document.getElementById('cast-status');
+const resolutionEl = document.getElementById('resolution');
+const bitrateEl = document.getElementById('bitrate');
 const params = new URLSearchParams(location.search);
 const videos = [...document.querySelectorAll('video')];
 
@@ -16,77 +20,22 @@ let pageError = ''; // a problem that isn't about one stream
 const big = () => streams[0];
 const streamOf = (video) => streams.find((s) => s.video === video);
 
-const browserCodecs = {
-  inflate: (b) => decompress(b, 'deflate'),
-  gunzip: (b) => decompress(b, 'gzip'),
-};
-async function decompress(bytes, format) {
-  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
-}
+const { makeLoader, snapTo, snapFps, bestLevel, rateText, codecName, COMMON_FPS } = StreamSnifferShared;
 
-// Each stream's requests can need their own Referer/Origin. The browser only applies them to
-// hosts the stream has registered with background.js, so register each host before its first
-// request.
-async function allowHost(stream, url) {
-  const host = new URL(url).hostname;
-  if (stream.hosts.has(host)) return;
-  const res = await chrome.runtime.sendMessage({ type: 'stream-host', streamId: stream.id, url });
-  if (!res?.ok) throw new Error(`Could not set up request headers for ${host}: ${res?.error ?? 'no response from background'}`);
-  stream.hosts.add(host);
-}
+// Registers a host for this stream's Referer/Origin before its first request there (see shared.js).
+const allowHost = (stream, url) => StreamSnifferShared.allowHost(stream.id, stream.hosts, url);
 
-// hls.js loader for every request of one stream: registers the host first (see allowHost), and
-// decodes image-disguised segments (see disguise.js) before the demuxer sees them. A segment
-// that's an image we can't decode fails loudly with the reason.
 function loaderFor(stream) {
-  return class extends Hls.DefaultConfig.loader {
-    load(context, config, callbacks) {
-      this.cancelled = false;
-      allowHost(stream, context.url).then(
-        () => {
-          if (!this.cancelled) super.load(context, config, unwrapping(stream, callbacks));
-        },
-        (err) => {
-          fail(stream, err.message);
-          callbacks.onError({ code: 0, text: err.message }, context, null, this.stats);
-        }
-      );
-    }
-    abort() {
-      this.cancelled = true;
-      super.abort();
-    }
-  };
-}
-
-function unwrapping(stream, callbacks) {
-  return {
-    ...callbacks,
-    onSuccess: (response, stats, ctx, details) => {
-      // A "playlist" that isn't one (an HTML error page, an empty body) fails as a load error, so
-      // hls.js retries it like any failed request. Playlist problems it skips are another matter
-      // (see hlsLogger).
-      if (typeof response.data === 'string' && !response.data.trimStart().startsWith('#EXTM3U')) {
-        const text = response.data.replace(/\s+/g, ' ').trim();
-        const sent = text ? `"${text.slice(0, 200)}${text.length > 200 ? '…' : ''}"` : 'an empty body';
-        return callbacks.onError({ code: response.code, text: `not a playlist (no #EXTM3U); server sent ${sent}` }, ctx, details, stats);
-      }
-      const bytes = response.data instanceof ArrayBuffer ? new Uint8Array(response.data) : null;
-      if (!bytes || !StreamSnifferDisguise.isDisguised(bytes)) return callbacks.onSuccess(response, stats, ctx, details);
-      StreamSnifferDisguise.decodeDisguisedSegment(bytes, browserCodecs).then(
-        (ts) => {
-          response.data = ts.buffer.slice(ts.byteOffset, ts.byteOffset + ts.byteLength);
-          if (stream.unwrapped++ === 0) render(); // noted in the stream's details
-          callbacks.onSuccess(response, stats, ctx, details);
-        },
-        (err) => {
-          fail(stream, `Couldn't decode a segment: ${err.message}`);
-          callbacks.onError({ code: 0, text: err.message }, ctx, details, stats);
-        }
-      );
+  return makeLoader({
+    allowHost: (url) => allowHost(stream, url),
+    onDisguised: () => {
+      if (stream.unwrapped++ === 0) render(); // noted in the stream's details
     },
-  };
+    onFail: (msg) => {
+      stream.loadError = msg; // says more than hls.js's error that follows (see the ERROR handler)
+      fail(stream, msg);
+    },
+  });
 }
 
 // Some live CDNs put a fresh token in segment paths on every playlist refresh. hls.js calls
@@ -129,8 +78,16 @@ function failPage(msg) {
   render();
 }
 
-// Plays source in slot 0 (big) or 1 (small), replacing whatever was there.
-async function startStream(source, slot) {
+// A stream that stops (the server didn't answer, timed out or had an error; the video couldn't
+// be decoded) is tried again by itself after these waits; one that plays again starts the count
+// over. A refused link (4xx) isn't: it has most likely expired, and only its page has a fresh one.
+const RETRY_DELAYS_S = [5, 15, 30];
+
+// Plays source in slot 0 (big) or 1 (small), replacing whatever was there. When it's a retry:
+// retries counts the automatic tries so far (see RETRY_DELAYS_S), lastReason says why the last
+// one stopped, manual is a press of Retry, and pick is the quality picked by hand before it
+// ({ bitrate, height }), kept if the stream still offers it.
+async function startStream(source, slot, { retries = 0, lastReason = '', manual = false, pick = null } = {}) {
   const old = streams[slot];
   if (old) await stopStream(old);
   const video = old?.video ?? videos.find((v) => !streamOf(v));
@@ -157,6 +114,34 @@ async function startStream(source, slot) {
     casting: false,
     skipped: 0, // playlist problems hls.js skipped (see hlsLogger)
     lastSkipped: '',
+    playingLevel: -1, // index into hls.levels of the picture on screen; -1 until the first one
+    rates: [], // the last few video segments' { level, bytes, duration }, for measuredMbps
+    fps: 0, // frames shown per second of video, counted as they're shown (see the frame counter)
+    quality: -1, // the quality picked in the menu: an index into hls.levels, or -1 for Auto
+    stopped: false, // hls.js gave up (a fatal error); Retry starts it again
+    loadError: '', // a problem the loader reported (see loaderFor)
+    restarting: false, // a retry of this stream has begun (see retry)
+    retries,
+    retryTimer: null, // the countdown to the next automatic try
+    mediaRecoveredAt: -Infinity, // performance.now() of the last decoder recovery (see the ERROR handler)
+    // Shown while a retry connects, until the picture is back.
+    retrying: retries > 0 || manual,
+    retryNote: manual
+      ? 'Retrying: connecting…'
+      : `Retry ${retries} of ${RETRY_DELAYS_S.length}: connecting… (it stopped because ${lastReason})`,
+    recovered: '', // e.g. "back after 2 automatic retries (2:31:05 PM)"
+    recoveredUntil: 0, // Date.now() until which that shows over the video
+    firstLevel: null, // the quality of the first segment loaded (see the start level)
+    // Frame drops (see watchFrames): recent { at, dropped, missing }, totals, and the counts
+    // the checks compare against.
+    frameEvents: [],
+    droppedTotal: 0,
+    missingTotal: 0,
+    droppedSeen: null, // the video's dropped-frame count at the last check
+    gapFrames: 0, // frames skipped in the video's timeline since the last check (see countFrames)
+    uneven: 0, // share of frames off the stream's beat (uneven timestamps; see countFrames)
+    codec: '', // e.g. "avc1.640028", once the first segment says
+    hardware: null, // whether the browser can decode it in hardware (see checkHardware)
   };
   streams[slot] = stream;
   pageError = '';
@@ -181,17 +166,50 @@ async function startStream(source, slot) {
     loader: loaderFor(stream),
     ignorePlaylistParsingErrors: true,
     debug: hlsLogger(stream),
+    // hls.js keeps everything already played by default. Over a game of several hours that fills
+    // the browser's media memory until it has to evict mid-playback, which can hitch. Live
+    // streams are never rewound that far, so keep a minute.
+    backBufferLength: 60,
+    // Assume a good connection (10 Mbps) until the first downloads measure the real one, so the
+    // automatic quality doesn't start out cautious. See also the start level, set on
+    // MANIFEST_PARSED.
+    abrEwmaDefaultEstimate: 10e6,
   }));
   hls.on(Hls.Events.ERROR, (_e, data) => {
     const code = data.response?.code;
     const why = data.response?.text ? ` (${data.response.text})` : parseProblem(data);
     const detail = `${data.type} / ${data.details}${why}${code ? ` — HTTP ${code}` : ''}${data.url ? ` — ${data.url}` : ''}${serverSent(data)}`;
+    // A decoding hiccup (a corrupt segment, a decoder reset) is fixed by hls.js itself: it resets
+    // the decoder and goes on from the same spot, without reloading. At most once in 30 s; a
+    // second one soon after stops the stream, and the automatic retries take over.
+    if (data.fatal && data.type === Hls.ErrorTypes.MEDIA_ERROR && performance.now() - stream.mediaRecoveredAt > 30000) {
+      stream.mediaRecoveredAt = performance.now();
+      console.warn('[stream-sniffer] fatal media error, recovering:', detail);
+      stream.lastProblem = `${new Date().toLocaleTimeString()}: the video decoder hit a problem (${data.details}); recovering`;
+      stream.lastProblemShort = 'The video decoder hit a problem; recovering…';
+      stream.problemKind = null; // over when the video plays again
+      render();
+      hls.recoverMediaError();
+      return;
+    }
     if (data.fatal) {
       stream.status = 'Stopped';
-      stream.lastProblem = stream.lastProblemShort = ''; // nothing is being retried any more
-      // Keep a more specific message (e.g. from allowHost) if one is already showing.
-      if (stream.error) fail(stream, stream.error, stream.errorShort);
-      else fail(stream, `Playback failed: ${detail}`, `Stopped: ${shortReason(data)}`);
+      stream.lastProblem = stream.lastProblemShort = ''; // hls.js isn't retrying it any more
+      stream.stopped = true;
+      // A loader problem (a host whose headers couldn't be set, a disguised segment that
+      // couldn't be decoded) says more than hls.js does. Any other message already showing is
+      // older and unrelated, and mustn't stop the retries.
+      const reason = stream.loadError || stopReason(data, code);
+      const refused = code >= 400 && code < 500;
+      if (!refused && stream.retries < RETRY_DELAYS_S.length) {
+        return scheduleRetry(stream, reason, detail);
+      }
+      const n = stream.retries;
+      const after = n ? ` after ${n} automatic ${n === 1 ? 'retry' : 'retries'}` : '';
+      const short = refused
+        ? `Stopped: ${reason}, so the link has probably expired. Reopen the stream from its page, or press Retry.`
+        : `Stopped${after}: ${reason}. Press Retry to try again.`;
+      fail(stream, `${short} (${detail})`, short);
     } else {
       // hls.js retries these itself, but a stall with no explanation looks like a frozen
       // picture; show the latest one until playback is healthy again.
@@ -215,14 +233,58 @@ async function startStream(source, slot) {
     render();
   };
   hls.on(Hls.Events.FRAG_LOADED, recovered('segment'));
+  // The bitrate a stream really delivers: each video segment's size over its length. A playlist's
+  // own figure is only a claim, and a playlist linked directly has none.
+  hls.on(Hls.Events.FRAG_LOADED, (_e, { frag, payload }) => {
+    if (frag.type !== 'main' || !(frag.duration > 0)) return;
+    stream.firstLevel ??= frag.level;
+    // payload is after any unwrapping (see makeLoader in shared.js), so a disguised segment
+    // counts as video.
+    stream.rates.push({ level: frag.level, bytes: payload?.byteLength || frag.stats.total, duration: frag.duration });
+    if (stream.rates.length > 8) stream.rates.shift();
+    if (stream === big()) renderBar();
+  });
   for (const e of [Hls.Events.MANIFEST_LOADED, Hls.Events.LEVEL_LOADED, Hls.Events.AUDIO_TRACK_LOADED, Hls.Events.SUBTITLE_TRACK_LOADED]) {
     hls.on(e, recovered('playlist'));
   }
-  hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
-    stream.levels = data.levels.length;
-    stream.status = 'Playing';
+  hls.on(Hls.Events.MANIFEST_PARSED, (_e, { levels }) => {
+    stream.levels = levels.length;
+    // Start on the best quality, and let Auto drop down if the connection can't keep up, rather
+    // than starting low and working up.
+    const picked = pick ? levels.findIndex((l) => l.bitrate === pick.bitrate && l.height === pick.height) : -1;
+    if (picked >= 0) {
+      stream.quality = picked;
+      hls.currentLevel = picked; // held there, as before the retry
+    } else if (levels.length > 1) {
+      hls.startLevel = bestLevel(levels);
+    }
+    stream.status = 'Playing'; // headers and disguised segments are in the stream's details
     render();
     startPlayback(stream);
+  });
+  // FRAG_CHANGED fires when a segment starts playing, so this is the quality on screen, not the
+  // one being downloaded ahead.
+  hls.on(Hls.Events.FRAG_CHANGED, (_e, { frag }) => {
+    if (stream.retrying) {
+      stream.retrying = false;
+      const n = stream.retries;
+      stream.recovered = `back after ${n ? `${n} automatic ${n === 1 ? 'retry' : 'retries'}` : 'Retry'} (${new Date().toLocaleTimeString()})`;
+      stream.recoveredUntil = Date.now() + 10000;
+      setTimeout(render, 10000);
+      render();
+    }
+    stream.retries = 0; // it plays: a later drop gets every automatic try again
+    if (frag.level === stream.playingLevel) return;
+    stream.playingLevel = frag.level;
+    render();
+  });
+  hls.on(Hls.Events.LEVELS_UPDATED, () => render());
+  hls.on(Hls.Events.BUFFER_CODECS, (_e, tracks) => {
+    const video = tracks.video ?? tracks.audiovideo;
+    if (!video?.codec || video.codec === stream.codec) return;
+    stream.codec = video.codec;
+    stream.codecContainer = video.container;
+    checkHardware(stream);
   });
   hls.loadSource(source.url);
   hls.attachMedia(video);
@@ -250,13 +312,62 @@ function serverSent(data) {
   return ` — server sent ${text ? `"${text.slice(0, 200)}${text.length > 200 ? '…' : ''}"` : 'an empty body'}`;
 }
 
+// Why a stream stopped, in plain words.
+function stopReason(data, code) {
+  if (/^not a playlist/.test(data.response?.text ?? '') || /ParsingError$/.test(data.details)) return "the server sent something that isn't a playlist";
+  if (code >= 500) return `the server had an error (HTTP ${code})`;
+  if (code >= 400) return `the server refused the link (HTTP ${code})`;
+  if (/Timeout$/.test(data.details)) return 'the server took too long to answer';
+  if (data.type === Hls.ErrorTypes.MEDIA_ERROR) return `the video couldn't be decoded (${data.details})`;
+  if (data.type !== Hls.ErrorTypes.NETWORK_ERROR) return `playback hit a problem (${data.details})`;
+  return "the server didn't answer (the connection dropped or couldn't be made)";
+}
+
+// Counts down to the next automatic try, saying why the stream stopped.
+function scheduleRetry(s, reason, detail) {
+  const n = s.retries + 1;
+  const total = RETRY_DELAYS_S.length;
+  const at = Date.now() + RETRY_DELAYS_S[s.retries] * 1000;
+  const what = s.retries ? `Retry ${s.retries} of ${total} didn't work: ${reason}` : `The stream stopped: ${reason}`;
+  s.status = `Stopped · retrying soon (try ${n} of ${total})`;
+  console.error(`[stream-sniffer] ${what}; retrying in ${RETRY_DELAYS_S[s.retries]} s:`, detail);
+  const tick = () => {
+    const left = Math.ceil((at - Date.now()) / 1000);
+    if (left <= 0) return retry(s, { retries: n, lastReason: reason });
+    s.errorShort = `${what}. Retrying in ${left} s (try ${n} of ${total}).`;
+    s.error = `${s.errorShort} (${detail})`;
+    render();
+  };
+  s.retryTimer = setInterval(tick, 1000);
+  tick();
+}
+
+// Starts a stopped stream again in its slot, with the same link and headers.
+// Only once per stream: a second press (a double-click, or Retry in both the message and the
+// menu) would otherwise start a second copy before the first replaced this one. A quality picked
+// by hand carries over.
+function retry(s, opts = {}) {
+  clearInterval(s.retryTimer);
+  const slot = streams.indexOf(s);
+  if (slot < 0 || s.restarting) return; // removed or replaced meanwhile, or already restarting
+  s.restarting = true;
+  const picked = s.quality >= 0 ? s.hls?.levels[s.quality] : null;
+  const pick = picked && { bitrate: picked.bitrate, height: picked.height };
+  startStream(s.source, slot, { ...opts, pick }).catch((err) => failPage(err.message));
+}
+const retryById = (id) => {
+  const s = streams.find((x) => x.id === id);
+  if (s) retry(s, { manual: true });
+};
+
 async function stopStream(s) {
+  clearInterval(s.retryTimer);
   s.hls?.destroy();
   s.hls = null;
   s.video.removeAttribute('src');
   s.video.load();
   // The relay bridge still fetches through this stream's header rule while it casts.
-  if (bridge?.stream === s && !bridge.stopped) return;
+  if (bridge?.cast.includes(s) && !bridge.stopped) return;
   const res = await chrome.runtime.sendMessage({ type: 'stream-remove', streamId: s.id });
   if (!res?.ok) failPage(`Could not remove the old stream's header rule: ${res?.error ?? 'no response from background'}`);
 }
@@ -274,7 +385,7 @@ async function startPlayback(s) {
     s.autoMuted = true;
     try {
       await v.play();
-      s.status += ' · muted (autoplay policy), unmute in the controls';
+      s.status += ' · muted (autoplay policy), unmute with the speaker button';
       render();
     } catch (err2) {
       fail(s, `video.play() failed even muted: ${err2.message}`);
@@ -307,22 +418,36 @@ function layout() {
     const i = streams.findIndex((s) => s.video === v);
     v.classList.toggle('big', i === 0);
     v.classList.toggle('small', i > 0);
-    v.controls = i === 0;
     v.hidden = i === -1 || streams[i].casting;
+    v.classList.toggle('tucked', i > 0 && smallHidden);
     v.removeAttribute('style'); // the big one fills the tab; the small one is placed below
     if (i > 0) placeSmall(v);
   }
   placeRemoveBtn();
 }
 
-// The × sits inside the small picture's top-right, clear of the corner that resizes it.
+// The – and × sit inside the small picture's top-right, clear of the corner that resizes it.
 function placeRemoveBtn() {
   const small = streams[1];
-  removeSmallBtn.hidden = !small || small.casting;
+  removeSmallBtn.hidden = hideSmallBtn.hidden = !small || small.casting || smallHidden;
   if (removeSmallBtn.hidden) return;
   const r = small.video.getBoundingClientRect();
   Object.assign(removeSmallBtn.style, { left: `${r.right - CORNER - 30}px`, top: `${r.top + 6}px` });
+  Object.assign(hideSmallBtn.style, { left: `${r.right - CORNER - 58}px`, top: `${r.top + 6}px` });
 }
+
+// The small picture can be hidden while its stream keeps playing. Swapping still works: the
+// stream swapped out becomes the hidden one. The bar's "Show small picture" (or H) brings it
+// back. Remembered, like its place, so a reload keeps it hidden.
+let smallHidden = false;
+function setSmallHidden(hide) {
+  smallHidden = hide;
+  layout();
+  render();
+  chrome.storage.local.set({ smallHidden }).catch((err) => failPage(`Couldn't save whether the small picture is hidden: ${err.message}`));
+}
+hideSmallBtn.addEventListener('click', () => setSmallHidden(true));
+showSmallBtn.addEventListener('click', () => setSmallHidden(false));
 removeSmallBtn.addEventListener('click', async () => {
   const s = streams[1];
   if (!s) return;
@@ -341,10 +466,12 @@ const MIN_WIDTH = 160;
 const DRAG_THRESHOLD = 4; // px of movement before a press counts as a drag, not a click
 let smallBox = null; // { x, y, w } in px
 chrome.storage.local
-  .get('smallBox')
-  .then(({ smallBox: saved }) => {
+  .get(['smallBox', 'smallHidden'])
+  .then(({ smallBox: saved, smallHidden: hidden }) => {
     if (saved) smallBox = saved;
+    smallHidden = !!hidden;
     layout();
+    render();
   })
   .catch((err) => failPage(`Couldn't read the small window's saved place: ${err.message}`));
 
@@ -447,6 +574,19 @@ for (const v of videos) {
     render();
     v.play().catch((err) => fail(s, `Couldn't resume after a pause: video.play() failed: ${err.message}`));
   });
+  v.addEventListener('resize', () => {
+    render(); // the quality readout follows
+    if (streamOf(v)) checkHardware(streamOf(v));
+  });
+  countFrames(v);
+  for (const e of ['play', 'pause', 'volumechange', 'timeupdate', 'durationchange']) {
+    v.addEventListener(e, () => streamOf(v) === big() && renderBar());
+  }
+  v.addEventListener('dblclick', (e) => {
+    if (streamOf(v) !== big()) return; // the small one swaps on click instead
+    e.preventDefault();
+    toggleFullscreen();
+  });
   v.addEventListener('enterpictureinpicture', syncPopout);
   v.addEventListener('leavepictureinpicture', syncPopout);
 }
@@ -468,9 +608,240 @@ navigator.mediaSession.setActionHandler('play', () => {
   }
 });
 
+// The stream's frame rate, from the spacing of its frames: the typical (median) gap in video
+// time between frames shown one after another, over 60 of them, snapped to the usual rates.
+// Lost frames leave bigger gaps, which the median ignores, so they don't lower it.
+function countFrames(v) {
+  let last = null; // the previous frame shown: { s, mediaTime, frames }
+  let gaps = []; // seconds of video between consecutive frames shown
+  const tick = (_now, meta) => {
+    const s = streamOf(v);
+    // Gaps in the timeline: a frame shown later than the next one was due means the frames in
+    // between weren't shown. Some the computer dropped (the browser counts those); the rest were
+    // never in the stream (see watchFrames). Jumps of a second or more are seeks, not gaps.
+    if (s?.fps && last?.s === s) {
+      const elapsed = meta.mediaTime - last.mediaTime;
+      const notShown = Math.round(elapsed * s.fps) - (meta.presentedFrames - last.frames);
+      if (elapsed > 0 && elapsed < 1 && notShown > 0) s.gapFrames += notShown;
+    }
+    if (s && last?.s === s && meta.presentedFrames - last.frames === 1) {
+      const gap = meta.mediaTime - last.mediaTime;
+      if (gap > 0 && gap < 0.2) gaps.push(gap);
+    } else if (last?.s !== s) {
+      gaps = [];
+    }
+    last = s && { s, mediaTime: meta.mediaTime, frames: meta.presentedFrames };
+    if (gaps.length >= 60) {
+      const beat = gaps.slice().sort((a, b) => a - b)[gaps.length >> 1];
+      const fps = snapFps(1 / beat);
+      // Off the beat: a gap that isn't a whole number of frames (bunched frames, or a late one).
+      // Whole multiples are frames that weren't shown, counted elsewhere.
+      const offBeat = gaps.filter((g) => Math.abs(g / beat - Math.round(g / beat)) > 0.25 || g / beat < 0.75).length;
+      const uneven = offBeat / gaps.length;
+      gaps = [];
+      if (s.fps !== fps || s.uneven !== uneven) {
+        s.fps = fps;
+        s.uneven = uneven;
+        render(); // the bar, and the menu's timing note
+      }
+    }
+    v.requestVideoFrameCallback(tick);
+  };
+  v.requestVideoFrameCallback(tick);
+}
+
+// Every second, for each picture on screen: frames Chrome's video player skipped (decoded but
+// never shown, as the browser counts them; see skipReason) and frames missing from the stream
+// itself (timeline gaps the player didn't account for). The last 10 s of them show over the
+// video; totals in the menu.
+const FRAME_WINDOW_MS = 10000;
+setInterval(() => {
+  let changed = false;
+  for (const s of streams) {
+    const shown = s.hls && !s.stopped && !document.hidden && !s.video.paused && !(s !== big() && smallHidden);
+    const dropped = s.video.getVideoPlaybackQuality().droppedVideoFrames;
+    const newDropped = shown && s.droppedSeen != null ? Math.max(0, dropped - s.droppedSeen) : 0;
+    s.droppedSeen = dropped;
+    const missing = shown ? Math.max(0, s.gapFrames - newDropped) : 0;
+    s.gapFrames = 0;
+    if (newDropped || missing) {
+      s.frameEvents.push({ at: Date.now(), dropped: newDropped, missing });
+      s.droppedTotal += newDropped;
+      s.missingTotal += missing;
+      changed = true;
+    }
+    const recent = s.frameEvents.filter((e) => Date.now() - e.at < FRAME_WINDOW_MS);
+    if (recent.length !== s.frameEvents.length) changed = true;
+    s.frameEvents = recent;
+  }
+  if (changed) render();
+}, 1000);
+
+function framesWarning(s) {
+  if (!frameWarnings) return '';
+  const dropped = s.frameEvents.reduce((n, e) => n + e.dropped, 0);
+  const missing = s.frameEvents.reduce((n, e) => n + e.missing, 0);
+  if (!dropped && !missing) return '';
+  const parts = [
+    dropped && `${dropped} skipped by Chrome's video player (${skipReason(s)})`,
+    missing && `${missing} missing from the stream itself (the source skipped them)`,
+  ].filter(Boolean);
+  const cadence = cadenceNote(s);
+  return `Frames in the last 10 s: ${parts.join(' · ')}${cadence ? ` · ${cadence}` : ''}`;
+}
+
+// Why Chrome skipped frames: it shows each one when its timestamp says, in step with the sound,
+// and skips any that land late. Uneven timestamps in the stream make some land late however fast
+// the computer is; otherwise it's decoding that couldn't keep up.
+const UNEVEN = 0.05; // off-beat share above which a stream's timing counts as uneven
+function skipReason(s) {
+  if (s.uneven >= UNEVEN) {
+    return `the stream's frame timing is uneven, ${Math.round(s.uneven * 100)}% of frames off their beat, so some land late; that's the stream, not your computer`;
+  }
+  // Chrome doesn't say which; whether the format has hardware decoding is the best clue.
+  if (s.hardware === false) return 'this format has no hardware decoding here, so the processor decodes it and may not keep up';
+  if (s.hardware === true) return 'late for their slot; not decoding speed, this format is decoded in hardware';
+  return `late for their slot, or decoding couldn't keep up${streams.length > 1 ? '; two streams are playing' : ''}`;
+}
+
+// Whether the browser can decode the stream's video format in hardware (its own answer:
+// "power efficient" means a hardware decoder). Asked once the format and size are known.
+async function checkHardware(s) {
+  if (!s.codec || !s.codecContainer || !navigator.mediaCapabilities) return;
+  const v = s.video;
+  try {
+    const info = await navigator.mediaCapabilities.decodingInfo({
+      type: 'media-source',
+      video: {
+        contentType: `${s.codecContainer}; codecs="${s.codec}"`,
+        width: v.videoWidth || 1920,
+        height: v.videoHeight || 1080,
+        bitrate: Math.round(measuredMbps(s) * 1e6) || 8e6,
+        framerate: s.fps || 60,
+      },
+    });
+    s.hardware = info.supported ? info.powerEfficient : false;
+  } catch (err) {
+    console.warn('[stream-sniffer] could not ask about hardware decoding:', err);
+    s.hardware = null;
+  }
+  render();
+}
+
+// e.g. "H.264, hardware decoding available"
+function decodingText(s) {
+  if (!s.codec) return '';
+  const name = codecName(s.codec) || s.codec;
+  if (s.hardware == null) return name;
+  return `${name}, ${s.hardware ? 'hardware decoding available' : 'no hardware decoding for this format: the processor decodes it'}`;
+}
+
+// The display's refresh rate, from the browser's own frame timing (the median gap over 2 s,
+// which a busy moment doesn't skew). Measured again when the window may have moved to another
+// screen.
+const COMMON_HZ = [24, 25, 30, 48, 50, 60, 72, 75, 90, 100, 120, 144, 165, 240];
+let displayHz = 0;
+let measuringHz = false;
+function measureHz() {
+  if (document.hidden || measuringHz) return;
+  measuringHz = true;
+  const gaps = [];
+  let prev = null;
+  const step = (t) => {
+    if (prev != null) gaps.push(t - prev);
+    prev = t;
+    if (gaps.length < 120) return requestAnimationFrame(step);
+    measuringHz = false;
+    const median = gaps.sort((a, b) => a - b)[gaps.length >> 1];
+    displayHz = snapTo(1000 / median, COMMON_HZ, 2);
+    render();
+  };
+  requestAnimationFrame(step);
+}
+measureHz();
+let hzTimer;
+const remeasureHz = () => {
+  clearTimeout(hzTimer);
+  hzTimer = setTimeout(measureHz, 1000);
+};
+addEventListener('resize', remeasureHz);
+document.addEventListener('fullscreenchange', remeasureHz);
+document.addEventListener('visibilitychange', remeasureHz);
+
+// A frame rate that doesn't divide the display's refresh rate can't be shown evenly: some
+// frames stay up longer than others (50 fps on 60 Hz: every fifth frame twice as long). That
+// steady hitch isn't dropped frames. Only said for the usual rates, which are measured reliably.
+function cadenceNote(s) {
+  const fps = s.fps;
+  if (!frameWarnings || !COMMON_FPS.includes(fps) || !COMMON_HZ.includes(displayHz)) return '';
+  if (fps > displayHz || displayHz % fps === 0) return '';
+  return `${fps} fps on a ${displayHz} Hz screen: a slight steady hitch, not lost frames`;
+}
+
+// The menu's switch for the warnings above (lost frames, refresh-rate hitches). The counting
+// goes on either way; the totals stay in the menu.
+let frameWarnings = true;
+const frameWarningsBox = document.getElementById('frame-warnings');
+chrome.storage.local
+  .get('frameWarnings')
+  .then(({ frameWarnings: saved }) => {
+    frameWarnings = saved !== false;
+    frameWarningsBox.checked = frameWarnings;
+    render();
+  })
+  .catch((err) => failPage(`Couldn't read whether frame warnings are on: ${err.message}`));
+frameWarningsBox.addEventListener('change', () => {
+  frameWarnings = frameWarningsBox.checked;
+  render();
+  chrome.storage.local.set({ frameWarnings }).catch((err) => failPage(`Couldn't save whether frame warnings are on: ${err.message}`));
+});
+
+// Over the recent segments of the quality on screen (any quality until one is on screen).
+function measuredMbps(s) {
+  const same = s.rates.filter((r) => r.level === s.playingLevel);
+  const rs = same.length ? same : s.rates;
+  const seconds = rs.reduce((sum, r) => sum + r.duration, 0);
+  return seconds ? (rs.reduce((sum, r) => sum + r.bytes, 0) * 8) / seconds / 1e6 : 0;
+}
+
+// "1080p", or the bitrate for a stream that doesn't say its resolution. A playlist linked
+// directly (no list of qualities) says neither.
+function levelName(l) {
+  if (l?.height) return `${l.height}p`;
+  if (l?.bitrate) return `${Math.round(l.bitrate / 1000)} kbps`;
+  return 'unknown quality';
+}
+
+// Which quality is on screen and why, e.g. "720p, picked automatically from 2 quality levels".
+function qualityText(s) {
+  const levels = s.hls?.levels ?? [];
+  if (!levels.length) return '';
+  const n = levels.length;
+  const count = `${n} quality level${n === 1 ? '' : 's'}`;
+  if (s.playingLevel < 0) return count;
+  // The decoded picture's real height beats what the playlist claims, and works when it claims
+  // nothing.
+  const now = s.video.videoHeight ? `${s.video.videoHeight}p` : levelName(levels[s.playingLevel]);
+  if (n === 1) return `${now}, the only quality level`;
+  if (s.quality < 0) return `${now}, picked automatically from ${count}`;
+  if (s.quality !== s.playingLevel) return `${now}, switching to ${levelName(levels[s.quality])} (of ${count})`;
+  return `${now}, picked by you (of ${count})`;
+}
+
+// The bar's quality menu. Auto lets hls.js follow the connection speed; a picked level stays
+// until changed. The switch happens at the next segment, so the picture doesn't stop.
+function setQuality(streamId, level) {
+  const s = streams.find((x) => x.id === streamId);
+  if (!s?.hls) return;
+  s.quality = level;
+  s.hls.nextLevel = level;
+  render();
+}
+
 // The short line over the video while a stream struggles; the full story is in its details.
 function health(s) {
   if (s.error) return ''; // a failed stream isn't buffering or retrying; its error line says why
+  if (s.retrying && !s.stopped) return s.retryNote;
   if (s.lastProblemShort) return s.lastProblemShort;
   return s.bufferingSince ? 'Buffering…' : '';
 }
@@ -484,8 +855,12 @@ function streamDetails(s) {
     !s.error && s.bufferingSince && `Buffering since ${s.bufferingSince}, waiting for video data`,
     !s.error && s.bufferingSince && s.lastSkipped && `Last skipped playlist problem ${s.lastSkipped}`,
     s.mode && `Headers: ${s.mode}`,
-    s.levels && plural(s.levels, 'quality level'),
     s.unwrapped && 'Segments are disguised as images; decoding them',
+    (s.droppedTotal || s.missingTotal) &&
+      `Frames so far: ${s.droppedTotal} skipped by Chrome's video player, ${s.missingTotal} missing from the stream`,
+    s.uneven >= UNEVEN && `Frame timing uneven: ${Math.round(s.uneven * 100)}% of frames off their beat`,
+    decodingText(s),
+    cadenceNote(s),
     s.skipped && `hls.js skipped ${plural(s.skipped, 'playlist problem')} (last ${s.lastSkipped})`,
     s.resumes && `Resumed after ${plural(s.resumes, 'pause')} (last ${s.lastResume})`,
     ignoredPauses && `Ignored ${plural(ignoredPauses, 'pause request')} from Chrome's media controls (last ${lastIgnoredPause})`,
@@ -493,49 +868,143 @@ function streamDetails(s) {
   ].filter(Boolean);
 }
 
+// A message over the video, with an × that hides it, and Retry for a stopped stream.
+const dismissed = new Set();
+let renderedProblems = '';
+function retryButton(streamId) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'retry';
+  b.textContent = 'Retry';
+  b.title = 'Start this stream again, with the same link';
+  b.addEventListener('click', () => retryById(streamId));
+  return b;
+}
+// A short note after a message's text, gone after 1.5 s.
+function flashNote(after, text, cls) {
+  after.parentElement?.querySelector('.copied, .copy-failed')?.remove();
+  const note = document.createElement('span');
+  note.className = cls;
+  note.textContent = text;
+  after.after(note);
+  setTimeout(() => note.remove(), 1500);
+}
+
+function problemLine({ cls, text, copy, key, retryId }) {
+  const p = document.createElement('p');
+  p.className = cls;
+  const span = document.createElement('span');
+  span.className = 'text';
+  span.textContent = text;
+  span.dataset.copy = copy ?? text; // render() keeps it current, e.g. a countdown
+  // A click copies the message as it reads now, with its technical detail.
+  span.title = 'Click to copy';
+  span.addEventListener('click', () => {
+    navigator.clipboard.writeText(span.dataset.copy).then(
+      () => flashNote(span, 'Copied', 'copied'),
+      (err) => flashNote(span, `Couldn't copy: ${err.message}`, 'copy-failed')
+    );
+  });
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'dismiss';
+  close.textContent = '×';
+  close.title = close.ariaLabel = 'Dismiss this message';
+  close.addEventListener('click', () => {
+    dismissed.add(key);
+    render();
+  });
+  p.append(span);
+  if (retryId) p.append(retryButton(retryId));
+  p.append(close);
+  return p;
+}
+
 let renderedEntries = '';
-const openDetails = new Set(); // ids of streams whose Details section is open
+let renderedShape = '';
+const openDetails = new Set(); // sources whose Details section is open (a retry keeps the source)
 function render() {
   const label = (s) => (streams.length > 1 ? (s === big() ? 'Big: ' : 'Small: ') : '');
   const lines = [];
-  if (pageError) lines.push(['error', pageError]);
+  // key: what dismissing remembers. Usually the text, so a new or changed message (they carry a
+  // time) still shows; a retry countdown keeps one key while its seconds tick.
+  const line = (cls, text, more = {}) => lines.push({ cls, text, key: text, retryId: null, ...more });
+  if (pageError) line('error', pageError);
   for (const s of streams) {
-    if (s.error) lines.push(['error', `${label(s)}${s.errorShort} (details in ⚙)`]);
-    if (health(s)) lines.push(['warn', label(s) + health(s)]);
+    // The short form over the video; a click copies the full one, technical detail included.
+    if (s.error) {
+      line('error', `${label(s)}${s.errorShort} (details in ⚙)`, {
+        copy: label(s) + s.error,
+        retryId: s.stopped ? s.id : null,
+        ...(s.retryTimer && { key: `countdown:${s.id}` }),
+      });
+    }
+    if (health(s)) line('warn', label(s) + health(s));
+    if (s.recovered && Date.now() < s.recoveredUntil) line('ok', label(s) + s.recovered[0].toUpperCase() + s.recovered.slice(1));
+    // One key while drops go on, so dismissing it keeps it hidden until they stop for 10 s.
+    if (framesWarning(s)) line('warn', label(s) + framesWarning(s), { key: `frames:${s.id}` });
   }
-  problemsEl.replaceChildren(
-    ...lines.map(([cls, text]) => {
-      const p = document.createElement('p');
-      p.className = cls;
-      p.textContent = text;
-      return p;
-    })
-  );
+  // Forgetting dismissed messages that are gone keeps the set small.
+  const keys = new Set(lines.map((l) => l.key));
+  for (const k of dismissed) if (!keys.has(k)) dismissed.delete(k);
+  const shown = lines.filter((l) => !dismissed.has(l.key));
+  // Rebuilt only when the set of messages changes, so an × or Retry isn't swapped out from under
+  // a click; a countdown just updates its text.
+  const structure = JSON.stringify(shown.map(({ cls, key, retryId }) => [cls, key, retryId]));
+  if (structure !== renderedProblems) {
+    renderedProblems = structure;
+    problemsEl.replaceChildren(...shown.map(problemLine));
+  } else {
+    shown.forEach((l, i) => {
+      const span = problemsEl.children[i].firstChild;
+      if (span.textContent !== l.text) span.textContent = l.text;
+      span.dataset.copy = l.copy ?? l.text;
+    });
+  }
 
   // Rebuilt only when its text changes, so a link isn't swapped out from under a click.
   const entries = streams.map((s, i) => ({
-    id: s.id,
-    heading: streams.length > 1 ? (i === 0 ? 'Big screen' : 'Small screen') : 'Now playing',
+    detailsKey: s.source.capId ?? s.source.url,
+    heading:
+      streams.length < 2
+        ? 'Now playing'
+        : i === 0
+          ? 'Big screen'
+          : smallHidden
+            ? 'Small screen, hidden (press S to swap, H to show it)'
+            : 'Small screen (click it or press S to swap)',
     pageUrl: s.source.pageUrl,
     pageTitle: s.source.pageTitle,
-    status: s.status,
+    // The short story; the rest is under Details.
+    status: [s.status, s.recovered, qualityText(s)].filter(Boolean).join(' · '),
     details: streamDetails(s),
+    retryId: s.stopped ? s.id : null,
   }));
   if (JSON.stringify(entries) !== renderedEntries) {
     renderedEntries = JSON.stringify(entries);
-    streamsEl.replaceChildren(...entries.map(streamEntry));
+    // Rebuilt only when something clickable changes (which stream, its link, Retry), so a status
+    // update (frame counts, quality) doesn't swap Details or a link out from under a click; the
+    // text updates in place.
+    const shape = JSON.stringify(entries.map((e) => [e.detailsKey, e.pageUrl, e.pageTitle, e.retryId]));
+    if (shape !== renderedShape) {
+      renderedShape = shape;
+      streamsEl.replaceChildren(...entries.map(streamEntry));
+    }
+    entries.forEach((e, i) => fillStreamEntry(streamsEl.children[i], e));
   }
+
+  renderBar();
 
   const b = big()?.source;
   document.title = b?.pageUrl ? `▶ ${b.pageTitle || b.pageUrl}` : 'Stream Sniffer Player';
 }
 
-// Shows which page a stream came from and its status, with the rest under Details.
+// Shows which page a stream came from and its status, with the rest under Details. This builds
+// the parts; fillStreamEntry sets their text.
 function streamEntry(e) {
   const el = document.createElement('div');
   el.className = 'stream';
   const h = document.createElement('h2');
-  h.textContent = e.heading;
   el.append(h);
   if (e.pageUrl) {
     const p = document.createElement('p');
@@ -550,16 +1019,28 @@ function streamEntry(e) {
     el.append(p);
   }
   const status = document.createElement('p');
-  status.className = 'muted small';
-  status.textContent = e.status;
+  status.className = 'status muted small';
   const details = document.createElement('details');
-  details.open = openDetails.has(e.id);
-  details.addEventListener('toggle', () => (details.open ? openDetails.add(e.id) : openDetails.delete(e.id)));
+  details.open = openDetails.has(e.detailsKey);
+  details.addEventListener('toggle', () => (details.open ? openDetails.add(e.detailsKey) : openDetails.delete(e.detailsKey)));
   const summary = document.createElement('summary');
   summary.className = 'muted small';
   summary.textContent = 'Details';
-  details.append(
-    summary,
+  const lines = document.createElement('div');
+  lines.className = 'lines';
+  details.append(summary, lines);
+  el.append(status);
+  if (e.retryId) el.append(retryButton(e.retryId));
+  el.append(details);
+  return el;
+}
+
+function fillStreamEntry(el, e) {
+  el.querySelector('h2').textContent = e.heading;
+  el.querySelector('.status').textContent = e.status;
+  const lines = el.querySelector('.lines');
+  if (JSON.stringify([...lines.children].map((p) => p.textContent)) === JSON.stringify(e.details)) return;
+  lines.replaceChildren(
     ...e.details.map((line) => {
       const p = document.createElement('p');
       p.className = 'small';
@@ -567,8 +1048,6 @@ function streamEntry(e) {
       return p;
     })
   );
-  el.append(status, details);
-  return el;
 }
 
 function openMenu(open) {
@@ -592,15 +1071,23 @@ async function loadSource(capId) {
   return { ...c, capId };
 }
 
+// The streams also go to session storage as the last session, for the popup's "Reopen last
+// player" after this tab is closed. Like the sources it points to, it lasts until Chrome quits
+// or the extension reloads.
 function persist() {
-  history.replaceState(null, '', `?${new URLSearchParams(streams.map((s) => ['cap', s.source.capId]))}`);
+  const caps = streams.map((s) => s.source.capId);
+  history.replaceState(null, '', `?${new URLSearchParams(caps.map((id) => ['cap', id]))}`);
+  if (!caps.length) return;
+  chrome.storage.session.set({ lastSession: caps }).catch((err) => failPage(`Couldn't save this session for reopening: ${err.message}`));
 }
 
 // Pop the big video out into Chrome's floating picture-in-picture window, or bring it back.
 // The label follows the real state, so closing the floating window by hand updates it too.
 const popoutBtn = document.getElementById('popout');
 function syncPopout() {
-  popoutBtn.textContent = document.pictureInPictureElement ? 'Back to tab' : 'Pop out';
+  const out = !!document.pictureInPictureElement;
+  popoutBtn.ariaLabel = out ? 'Back to tab' : 'Pop out';
+  popoutBtn.title = out ? 'Back to tab' : 'Pop out: play in a floating window that stays on top';
 }
 popoutBtn.addEventListener('click', async () => {
   pageError = '';
@@ -614,6 +1101,216 @@ popoutBtn.addEventListener('click', async () => {
   render();
 });
 
+// The control bar for the big picture, in place of Chrome's (see player.html). Icons are
+// Material Design icons, as in Chrome's own controls.
+const ICONS = {
+  play: 'M8 5v14l11-7z',
+  volume: 'M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z',
+  muted: 'M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z',
+  popout: 'M19 11h-8v6h8v-6zm4 8V4.98C23 3.88 22.1 3 21 3H3c-1.1 0-2 .88-2 1.98V19c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2zm-2 .02H3V4.97h18v14.05z',
+  fullscreen: 'M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z',
+  exitFullscreen: 'M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z',
+};
+function setIcon(btn, name) {
+  if (btn.dataset.icon === name) return;
+  btn.dataset.icon = name;
+  btn.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[name]}"/></svg>`;
+}
+const bar = document.getElementById('bar');
+const playBtn = document.getElementById('play');
+const muteBtn = document.getElementById('mute');
+const volumeEl = document.getElementById('volume');
+const liveBtn = document.getElementById('live');
+const timeEl = document.getElementById('time');
+const qualityWrap = document.getElementById('quality-wrap');
+const qualityBtn = document.getElementById('quality');
+const qualityMenu = document.getElementById('quality-menu');
+const fullscreenBtn = document.getElementById('fullscreen');
+setIcon(playBtn, 'play');
+setIcon(popoutBtn, 'popout');
+setIcon(fullscreenBtn, 'fullscreen');
+
+function clock(t) {
+  t = Math.floor(t);
+  const [h, m, sec] = [Math.floor(t / 3600), Math.floor(t / 60) % 60, t % 60];
+  return `${h ? `${h}:${String(m).padStart(2, '0')}` : m}:${String(sec).padStart(2, '0')}`;
+}
+
+// How far behind the live edge counts as "behind": a few segments.
+function behindLive(s) {
+  const edge = s.hls.liveSyncPosition;
+  const target = s.hls.latestLevelDetails?.targetduration || 2;
+  return edge != null && edge - s.video.currentTime > Math.max(10, 3 * target);
+}
+
+function renderBar() {
+  const s = big();
+  bar.hidden = !s?.hls;
+  if (bar.hidden) return closeQualityMenu();
+  const v = s.video;
+  // Live streams just play (see the 'pause' listener), so there's no pause button; play shows
+  // only for a video that stopped and needs a press to start again.
+  playBtn.hidden = !v.paused;
+  showSmallBtn.hidden = !(smallHidden && streams[1] && !streams[1].casting);
+  const silent = v.muted || v.volume === 0;
+  setIcon(muteBtn, silent ? 'muted' : 'volume');
+  muteBtn.ariaLabel = silent ? 'Unmute' : 'Mute';
+  muteBtn.title = `${muteBtn.ariaLabel} (M)`;
+  volumeEl.value = silent ? 0 : v.volume;
+
+  const live = !!s.hls.latestLevelDetails?.live;
+  liveBtn.hidden = !live;
+  timeEl.hidden = live;
+  if (live) {
+    const behind = behindLive(s);
+    liveBtn.textContent = 'LIVE';
+    liveBtn.classList.toggle('at-edge', !behind);
+    liveBtn.title = behind ? 'Behind live: click to jump to live' : 'Playing live';
+  } else {
+    timeEl.textContent = Number.isFinite(v.duration) ? `${clock(v.currentTime)} / ${clock(v.duration)}` : clock(v.currentTime);
+  }
+
+  // The resolution on screen; with more than one quality it opens the quality menu.
+  const levels = s.hls.levels ?? [];
+  const playing = levels[s.playingLevel];
+  // e.g. "1080p60" and "6.2 Mbps"
+  resolutionEl.textContent = v.videoHeight ? `${v.videoHeight}p${s.fps || ''}` : playing ? levelName(playing) : '';
+  bitrateEl.textContent = rateText(measuredMbps(s));
+  qualityWrap.hidden = !resolutionEl.textContent;
+  qualityBtn.disabled = levels.length < 2;
+  const what = 'Resolution and frame rate on screen, and the bitrate measured over the last few segments';
+  qualityBtn.title = levels.length < 2 ? `${what}. This stream has only one quality.` : `${what}. Click to pick a quality (now: ${s.quality < 0 ? 'Auto' : 'picked by you'}).`;
+  if (qualityBtn.disabled) closeQualityMenu();
+  else if (!qualityMenu.hidden) fillQualityMenu(s);
+}
+
+// Auto first, then each quality, highest first. Rebuilt only when it changes, so an item isn't
+// swapped out from under a click.
+function fillQualityMenu(s) {
+  const h = s.video.videoHeight;
+  const items = [
+    { index: -1, name: s.quality < 0 && h ? `Auto (${h}p)` : 'Auto', rate: '' },
+    ...s.hls.levels
+      .map((l, index) => ({ index, name: levelName(l), rate: l.bitrate ? `${(l.bitrate / 1e6).toFixed(1)} Mbps` : '', bitrate: l.bitrate }))
+      .sort((a, b) => b.bitrate - a.bitrate),
+  ];
+  const key = JSON.stringify([s.id, s.quality, items]);
+  if (qualityMenu.dataset.key === key) return;
+  qualityMenu.dataset.key = key;
+  qualityMenu.replaceChildren(
+    ...items.map((it) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.role = 'menuitemradio';
+      b.setAttribute('aria-checked', String(it.index === s.quality));
+      const name = document.createElement('span');
+      name.textContent = it.name;
+      b.append(name);
+      if (it.rate) {
+        const rate = document.createElement('span');
+        rate.className = 'rate';
+        rate.textContent = it.rate;
+        b.append(rate);
+      }
+      b.addEventListener('click', () => {
+        closeQualityMenu();
+        setQuality(s.id, it.index);
+      });
+      return b;
+    })
+  );
+}
+function openQualityMenu() {
+  qualityMenu.hidden = false;
+  qualityBtn.ariaExpanded = 'true';
+  fillQualityMenu(big());
+}
+function closeQualityMenu() {
+  qualityMenu.hidden = true;
+  qualityBtn.ariaExpanded = 'false';
+}
+qualityBtn.addEventListener('click', () => (qualityMenu.hidden ? openQualityMenu() : closeQualityMenu()));
+addEventListener('pointerdown', (e) => {
+  if (!qualityWrap.contains(e.target)) closeQualityMenu();
+});
+
+playBtn.addEventListener('click', () => {
+  const s = big();
+  s?.video.play().catch((err) => fail(s, `video.play() failed: ${err.message}`));
+});
+function toggleMute() {
+  const s = big();
+  if (!s?.hls) return;
+  const v = s.video;
+  if (v.muted || v.volume === 0) {
+    v.muted = false;
+    if (v.volume === 0) v.volume = 0.5;
+  } else {
+    v.muted = true;
+  }
+  s.autoMuted = false;
+}
+muteBtn.addEventListener('click', toggleMute);
+volumeEl.addEventListener('input', () => {
+  const s = big();
+  if (!s?.hls) return;
+  s.video.volume = Number(volumeEl.value);
+  s.video.muted = s.video.volume === 0;
+  s.autoMuted = false;
+});
+liveBtn.addEventListener('click', () => {
+  const s = big();
+  if (s?.hls && behindLive(s)) s.video.currentTime = s.hls.liveSyncPosition;
+});
+
+// Full screen takes the whole page, so the small picture and messages stay. (Chrome's own
+// would take just the video, and won't let the page switch it over afterwards.) The button,
+// F, and a double-click on the big picture all toggle it.
+async function toggleFullscreen() {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await document.documentElement.requestFullscreen();
+  } catch (err) {
+    failPage(`Couldn't change full screen: ${err.message}`);
+  }
+}
+fullscreenBtn.addEventListener('click', toggleFullscreen);
+document.addEventListener('fullscreenchange', () => {
+  const on = !!document.fullscreenElement;
+  setIcon(fullscreenBtn, on ? 'exitFullscreen' : 'fullscreen');
+  fullscreenBtn.ariaLabel = on ? 'Exit full screen' : 'Full screen';
+  fullscreenBtn.title = on ? 'Exit full screen (F or Esc)' : 'Full screen (F, or double-click the video)';
+});
+
+// F: full screen. M: mute. S: swap the big and small pictures. H: hide or show the small one.
+// Esc: close the quality menu.
+// Not while typing in the form.
+addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input:not([type=range]), select, textarea')) return;
+  const key = e.key.toLowerCase();
+  if (key === 'escape') return closeQualityMenu();
+  if (key === 'f') toggleFullscreen();
+  else if (key === 'm') toggleMute();
+  else if (key === 's' && streams.length > 1) swap();
+  else if (key === 'h' && streams.length > 1) setSmallHidden(!smallHidden);
+  else return;
+  e.preventDefault();
+});
+
+// The bar and the mouse pointer fade out once the mouse has rested for a few seconds, as with
+// Chrome's controls. Not while the pointer is on the bar or a menu is open.
+let idleTimer;
+function wake() {
+  document.body.classList.remove('idle');
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (big()?.hls && menu.hidden && qualityMenu.hidden && !bar.matches(':hover')) document.body.classList.add('idle');
+    else wake();
+  }, 3000);
+}
+for (const e of ['pointermove', 'pointerdown', 'keydown']) addEventListener(e, wake);
+wake();
+
 // The popup's "Add to player" sends this to the player tab used last.
 const myTabId = chrome.tabs.getCurrent().then((t) => t.id);
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -622,7 +1319,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.tabId !== id) return;
     try {
       const source = await loadSource(msg.capId);
-      await startStream(source, Math.min(streams.length, MAX_STREAMS - 1));
+      const slot = Math.min(streams.length, MAX_STREAMS - 1);
+      if (slot === 1 && smallHidden) setSmallHidden(false); // a stream just added should be seen
+      await startStream(source, slot);
       sendResponse({ ok: true });
     } catch (err) {
       failPage(err.message);
@@ -676,7 +1375,7 @@ async function bridgeLoop(b) {
     }
     if (b.stopped) return;
     if (res.status === 204) continue; // nothing to fetch during this poll
-    if (res.status === 404) return b.fail('the relay no longer knows this stream (did it restart?). Click "Cast via relay" again.');
+    if (res.status === 404) return b.fail('the relay no longer knows this stream (did it restart?). Click "Start casting" again.');
     if (res.status === 410) return b.fail((await res.json().catch(() => ({}))).error || 'stream retired by the relay');
     if (!res.ok) return b.fail(`relay error HTTP ${res.status}: ${await res.text()}`);
     const job = await res.json();
@@ -764,6 +1463,12 @@ relayBtn.addEventListener('click', async () => {
   // The TV takes over; stop playing here so nothing is downloaded twice. With a channel that
   // means both streams: the TV has them both, one at a time.
   for (const x of cast) {
+    // A stream counting down to an automatic retry would start playing here again mid-cast.
+    if (x.retryTimer) {
+      clearInterval(x.retryTimer);
+      x.retryTimer = null;
+      x.error = x.errorShort = '';
+    }
     if (!x.hls) continue;
     x.hls.destroy();
     x.hls = null;
@@ -812,6 +1517,18 @@ function fillForm() {
   for (const name of ['url', 'referer', 'origin']) form.elements[name].value = s?.[name] || '';
 }
 
+// The menu's fold-away sections stay as they were left. Only a click saves: init() opens "Play
+// a URL" when there's nothing to play, which shouldn't count.
+function rememberFold(details, key, name) {
+  details.querySelector('summary').addEventListener('click', () => {
+    chrome.storage.local
+      .set({ [key]: !details.open }) // the click hasn't toggled it yet
+      .catch((err) => failPage(`Couldn't save whether "${name}" is open: ${err.message}`));
+  });
+}
+const playUrl = document.getElementById('play-url');
+rememberFold(playUrl, 'playUrlOpen', 'Play a URL');
+
 form.addEventListener('submit', (e) => {
   e.preventDefault();
   saveSource(readForm())
@@ -829,14 +1546,19 @@ async function init() {
   if (!sources.length && params.get('url')) {
     sources.push(await saveSource({ url: params.get('url'), referer: params.get('referer') || '', origin: params.get('origin') || '' }));
   }
-  if (!sources.length) {
-    document.getElementById('play-url').open = true;
-    return openMenu(true);
-  }
+  if (!sources.length) return openMenu(true);
+  // Not awaited: the streams shouldn't wait on how a menu was left. If starting them fails
+  // first, the form stays open (see below): it's the way to recover.
+  chrome.storage.local
+    .get('playUrlOpen')
+    .then(({ playUrlOpen }) => !startFailed && (playUrl.open = playUrlOpen !== false))
+    .catch((err) => failPage(`Couldn't read whether "Play a URL" was left open: ${err.message}`));
   for (const [i, source] of sources.entries()) await startStream(source, i);
 }
+let startFailed = false;
 init().catch((err) => {
-  document.getElementById('play-url').open = true;
+  startFailed = true;
+  playUrl.open = true;
   openMenu(true);
   failPage(err.message);
 });

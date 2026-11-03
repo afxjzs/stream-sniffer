@@ -191,7 +191,7 @@
       // The player tab long-polls at least every ~25s; much longer means it's closed or stuck.
       const seen = s.bridgeSeenSecondsAgo;
       const bridgeWarning = seen === null || seen > 40
-        ? 'The Stream Sniffer player tab is not checking in. It does the fetching for the TV, so keep it open (reopen it and click "Cast via relay" if you closed it).'
+        ? 'The Stream Sniffer player tab is not checking in. It does the fetching for the TV, so keep it open (reopen it and click "Start casting" if you closed it).'
         : '';
       $('relay-errors').textContent = [bridgeWarning, ...st.errors.map((e) => `${new Date(e.at).toLocaleTimeString()}  ${e.error}`)]
         .filter(Boolean)

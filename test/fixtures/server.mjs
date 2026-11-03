@@ -190,6 +190,7 @@ self.addEventListener('fetch', (e) => {
   // /live/stall/: while Date.now() < until, the edge stays put; the next `hang` playlist
   // requests get no answer at all (held open until the server closes).
   const stall = { until: 0, edge: 0, hang: 0 };
+  let downDrops = 0;
   // allowed: the Referer prefix and CORS origin this CDN accepts.
   const makeCdn = (base, allowed) => http.createServer((req, res) => {
     const url = new URL(req.url, base);
@@ -259,8 +260,28 @@ self.addEventListener('fetch', (e) => {
         `#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=320x240\nindex.m3u8?token=${TOKEN}\n`
       );
     }
+    // /live/down/: the first two requests for the master playlist get no answer (the connection
+    // is dropped), as when a re-stream blips; hls.js retries once, then gives up.
+    if (url.pathname === '/live/down/master.m3u8' && ++downDrops <= 2) return res.socket.destroy();
+    if (url.pathname === '/live/down/master.m3u8') {
+      res.writeHead(200, { ...headers, 'content-type': 'application/vnd.apple.mpegurl' });
+      return res.end(`#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=320x240
+index.m3u8?token=${TOKEN}
+`);
+    }
+    // /live/multi/: two quality levels, the test video at 320x240 and at 1280x720 (under hi/).
+    if (url.pathname === '/live/multi/master.m3u8') {
+      res.writeHead(200, { ...headers, 'content-type': 'application/vnd.apple.mpegurl' });
+      return res.end(
+        `#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=320x240\nindex.m3u8?token=${TOKEN}&v=low\n` +
+          `#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720\nhi/index.m3u8?token=${TOKEN}\n`
+      );
+    }
     const disguise = DISGUISES[url.pathname.match(/^\/live\/(\w+)\//)?.[1]];
-    const file = path.join(streamDir, path.basename(url.pathname));
+    const sub = url.pathname.match(/^\/live\/(?:multi\/(hi)|(jitter))\//);
+    const dir = sub ? path.join(streamDir, sub[1] ?? sub[2]) : streamDir;
+    const file = path.join(dir, path.basename(url.pathname));
     if (!url.pathname.startsWith('/live/') || !fs.existsSync(file)) {
       res.writeHead(404);
       return res.end();

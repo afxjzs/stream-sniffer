@@ -30,7 +30,7 @@ const CAST_HTML_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), '
 // from the player tab is held open when there is nothing to fetch.
 const BRIDGE_TIMEOUT_MS = 20000;
 const POLL_HOLD_MS = 15000;
-const SUPERSEDED = 'another stream took over the relay (a newer "Cast via relay" click). The relay serves one stream at a time.';
+const SUPERSEDED = 'another stream took over the relay (a newer "Start casting" click). The relay serves one stream at a time.';
 
 // /health answers with this, so callers (and our own startup check) can tell this relay apart
 // from some other server that happens to hold the port.

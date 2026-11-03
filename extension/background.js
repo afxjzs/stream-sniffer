@@ -143,12 +143,25 @@ const STREAM_MESSAGES = {
   'stream-remove': removeStream,
   'player-reset': (tabId) => removeTabStreams(tabId).then(() => ({})),
 };
+// The popup's quality check plays streams too, but the popup isn't a tab: its requests have no
+// tab (TAB_ID_NONE), so its rules are also limited to requests this extension starts.
+const POPUP_URL = chrome.runtime.getURL('popup.html');
+// The popup holds a connection open while it's up; when it closes (even mid-check), its header
+// rules go, so none outlive it.
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'popup') return;
+  port.onDisconnect.addListener(() => {
+    serialRules(() => removeTabStreams(chrome.tabs.TAB_ID_NONE)).catch((err) =>
+      console.error('[stream-sniffer] failed to remove the closed popup\'s header rules', err)
+    );
+  });
+});
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const handler = STREAM_MESSAGES[msg?.type];
   if (!handler) return false;
-  const tabId = sender.tab?.id;
+  const tabId = sender.tab?.id ?? (sender.url?.startsWith(POPUP_URL) ? chrome.tabs.TAB_ID_NONE : null);
   if (tabId == null) {
-    sendResponse({ error: `${msg.type} must come from a tab` });
+    sendResponse({ error: `${msg.type} must come from a tab or the popup` });
     return false;
   }
   serialRules(() => handler(tabId, msg))
@@ -221,7 +234,14 @@ function streamRule(tabId, s) {
       // an ACAO for the embed origin only, should Chrome ever enforce it here.
       responseHeaders: [{ header: 'access-control-allow-origin', operation: 'set', value: '*' }],
     },
-    condition: { tabIds: [tabId], requestDomains: s.hosts, resourceTypes: ['xmlhttprequest', 'media', 'other'] },
+    condition: {
+      tabIds: [tabId],
+      requestDomains: s.hosts,
+      resourceTypes: ['xmlhttprequest', 'media', 'other'],
+      // No tab means the popup (see POPUP_URL); without this, the rule would also catch other
+      // tabless requests, such as a site's service worker.
+      ...(tabId === chrome.tabs.TAB_ID_NONE && { initiatorDomains: [chrome.runtime.id] }),
+    },
   };
 }
 

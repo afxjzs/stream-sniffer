@@ -8,10 +8,30 @@
 <body class="player">
   <!-- Two video elements: one fills the tab, the other floats small on top. Clicking the small
        one swaps them. Each keeps its own stream, so a swap reloads nothing. -->
-  <video class="big" controls playsinline></video>
-  <video class="small" playsinline hidden title="Click to swap with the big picture. Drag to move; drag a corner to resize."></video>
+  <!-- No Chrome controls: the page can't add to them, and their fullscreen shows only the video
+       (hiding the small picture and messages). #bar replaces them. -->
+  <video class="big" playsinline></video>
+  <video class="small" playsinline hidden></video>
   <!-- Follows the small picture around (a video element can't hold children). -->
+  <button id="hide-small" type="button" hidden aria-label="Hide the small picture" title="Hide the small picture; it keeps playing (H)">–</button>
   <button id="remove-small" type="button" hidden aria-label="Remove the small stream" title="Remove the small stream">×</button>
+
+  <!-- The big picture's controls. Fades out, like Chrome's, once the mouse rests. -->
+  <div id="bar" hidden>
+    <button id="play" type="button" class="icon" aria-label="Play" title="Play" hidden></button>
+    <button id="mute" type="button" class="icon" aria-label="Mute" title="Mute (M)"></button>
+    <input id="volume" type="range" min="0" max="1" step="0.05" aria-label="Volume" title="Volume">
+    <button id="live" type="button" title="Jump to live"></button>
+    <span id="time"></span>
+    <span class="spacer"></span>
+    <button id="show-small" type="button" hidden title="Show the small picture again (H)">Show small picture</button>
+    <div id="quality-wrap">
+      <button id="quality" type="button" aria-haspopup="menu" aria-expanded="false" title="Quality"><span id="resolution"></span><span id="bitrate"></span></button>
+      <div id="quality-menu" role="menu" hidden></div>
+    </div>
+    <button id="popout" type="button" class="icon" aria-label="Pop out" title="Pop out: play in a floating window that stays on top"></button>
+    <button id="fullscreen" type="button" class="icon" aria-label="Full screen" title="Full screen (F, or double-click the video)"></button>
+  </div>
 
   <!-- Errors and buffering, over the video, only while something is wrong. -->
   <div id="problems"></div>
@@ -19,25 +39,31 @@
   <button id="settings" type="button" aria-label="Settings" aria-expanded="false" title="Settings">⚙</button>
   <div id="menu" hidden>
     <div id="streams"></div>
-    <details id="play-url">
-      <summary>Play a URL…</summary>
+    <label class="toggle"><input id="frame-warnings" type="checkbox" checked> Warn about lost frames and refresh-rate hitches</label>
+    <!-- Casting stays in view: it's what the menu is opened for most. -->
+    <div id="cast">
+      <p class="muted small">Cast via relay (beta)</p>
+      <div class="actions">
+        <button id="relay" type="button" title="Experimental: needs the relay running (node relay/server.mjs)">Start casting</button>
+      </div>
+      <p id="cast-status" class="muted small"></p>
+      <!-- The relay's cast page. It can load Google's Cast SDK, which extension pages can't. -->
+      <iframe id="cast-frame" hidden title="Cast controls"></iframe>
+    </div>
+    <!-- Folds away; the player remembers whether it was left open. -->
+    <details id="play-url" open>
+      <summary class="muted small">Play a URL on the big screen</summary>
       <form id="form">
         <label>Stream URL <input name="url" type="url" required placeholder="https://…/index.m3u8"></label>
         <label>Referer <input name="referer" type="url" placeholder="https://embed-site/ (optional)"></label>
         <label>Origin <input name="origin" type="url" placeholder="https://embed-site (optional)"></label>
-        <button type="submit">Play on the big screen</button>
+        <button type="submit">Play</button>
       </form>
     </details>
-    <div class="actions">
-      <button id="popout" type="button" title="Play in a floating window that stays on top">Pop out</button>
-      <button id="relay" type="button" title="Experimental: needs the relay running (node relay/server.mjs)">Cast via relay (beta)</button>
-    </div>
-    <p id="cast-status" class="muted small"></p>
-    <!-- The relay's cast page. It can load Google's Cast SDK, which extension pages can't. -->
-    <iframe id="cast-frame" hidden title="Cast controls"></iframe>
   </div>
   <script src="vendor/hls.min.js"></script>
   <script src="disguise.js"></script>
+  <script src="shared.js"></script>
   <script src="player.js"></script>
 </body>
 </html>

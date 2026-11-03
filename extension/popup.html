@@ -7,10 +7,16 @@
 <body class="popup">
   <header>
     <h1>Stream Sniffer</h1>
-    <button id="manual" class="link">Open player</button>
+    <span class="links">
+      <button id="reopen" class="link" hidden>Reopen last player</button>
+      <button id="manual" class="link">Open player</button>
+    </span>
   </header>
   <p id="status" class="muted"></p>
   <ul id="list"></ul>
+  <!-- For "Check quality" (see popup.js), which also loads hls.js on its first use. -->
+  <script src="disguise.js"></script>
+  <script src="shared.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

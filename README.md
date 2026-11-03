@@ -49,10 +49,17 @@ To update later, run `git pull`, then click the reload icon (↻) on the extensi
 1. Open the page with the video and press play.
 2. The Stream Sniffer icon shows a badge with the number of playlists it caught on that tab.
    Click the icon.
-3. Each playlist in the popup shows its server and file name, with two buttons:
+3. Each playlist in the popup shows its server and file name, and what it offers, read from the
+   playlist itself: for a playlist that lists qualities, the best one's resolution and frame
+   rate, its advertised bitrate, codec, and whether it's live (e.g. `3 qualities, best 1080p60 ·
+   6.0 Mbps advertised · H.264 · live`). A playlist of a single quality doesn't say those, so it
+   only shows whether it's live. Each playlist has these buttons:
    - **Add to player** adds the stream to the player tab you used last, as a small picture over
      the big one (or replaces the small one). With no player tab open, it opens one.
    - **Open in player** plays the stream in a new tab, sending the captured Referer and Origin.
+   - **Check quality** plays the stream's best quality muted in a small preview for a few
+     seconds, then reports what it measured (e.g. `Checked: 1080p60 · 6.2 Mbps measured`). It
+     downloads a few seconds of video. The measured bitrate is the one to trust.
 
    The **⋯** button shows the full URL, the headers the page sent, and three copy buttons:
    - **Copy URL** copies the playlist address.
@@ -60,20 +67,45 @@ To update later, run `git pull`, then click the reload icon (↻) on the extensi
    - **Copy curl command** copies a `curl` command that repeats the browser's request with every
      header. It's useful for testing what a stream server accepts.
 4. The player fills the tab with the video. With two streams, the second floats in a corner;
-   click it to swap the two pictures. Drag it to move it, or drag a corner to resize it; the
-   player remembers where you put it. Click its **×** to remove it. The sound always follows
-   the big picture. Each stream gets its own Referer and Origin, so the two can come from
-   different sites. Problems (errors, buffering, failed requests the player is retrying) show as
-   a short line over the video while they last. Live streams just play: if a video pauses (from
-   its controls, a media key, or Chrome itself), the player starts it again at once and notes it
-   in the ⚙ menu.
-5. The ⚙ button opens the player menu: where each stream came from and its status, **Play a
-   URL…** to play another URL on the big screen, **Pop out**, and the relay. Each stream's
-   **Details** has the full error, the stream URL, and other technical facts. **Pop out** moves
-   the big video into a small floating window that stays on top of other apps. Click **Back to
-   tab** (or close the floating window) to return it.
-6. To play a URL you already have, click **Open player** at the top of the popup. Then paste the
+   click it (or press **S**) to swap the two pictures. Drag it to move it, or drag a corner to
+   resize it; the player remembers where you put it. Click its **–** (or press **H**) to hide it
+   while its stream keeps playing; **S** still swaps, and **Show small picture** in the bar
+   brings it back. Click its **×** to remove it. The sound always follows the big picture. Each
+   stream gets its own Referer and Origin, so the two can come from different sites. Problems
+   (errors, buffering, failed requests the player is retrying) show as a short line over the
+   video while they last; click one to copy it with its technical detail. A decoding glitch is fixed in place without reloading. If a stream stops (its server
+   stopped answering or had an error, or the video couldn't be decoded twice within 30 s), the player
+   tries it again by itself (after 5, 15 and 30 seconds, with a countdown and the reason) and
+   says when it's back. A stopped stream also has a **Retry** button. A link the server refuses
+   (403, 404) isn't retried by itself: it has most likely expired, so reopen it from its page.
+   Live streams just play: if a video pauses (a media key, or Chrome itself), the player
+   starts it again at once and notes it in the ⚙ menu. If frames are lost, a warning says how
+   many in the last 10 seconds and where: skipped by Chrome's video player, or missing from the
+   stream itself. Chrome shows each frame when its timestamp says and skips any that land late,
+   so a stream with uneven frame timestamps (common in relayed re-streams) loses frames however
+   fast the computer is; the warning says when that's the case. The ⚙ menu keeps the totals,
+   says whether the stream's timing is uneven and whether its format can be decoded in hardware,
+   and notes a frame rate that doesn't fit the display's refresh rate (e.g. 50 fps on 60 Hz),
+   which shows a slight steady hitch. A switch in the menu turns these warnings off.
+5. The bar at the bottom controls the big picture. It fades out when the mouse rests. From left
+   to right: volume (**M** mutes), **LIVE** (grey when behind; click it to jump to live) or the
+   time, what is on screen (resolution and frame rate, e.g. 1080p60, and the bitrate measured from
+   the video it downloads), which opens a quality menu when the stream has more than one
+   (Auto starts on the best quality and drops down only if your connection can't keep up; a
+   picked quality stays), **Pop out**, and full screen.
+   **Pop out** moves the big video into a small floating window that stays on top of other
+   apps; click it again (or close the floating window) to bring it back. Full screen (or **F**,
+   or a double-click on the video) fills the screen with the whole player, small picture
+   included.
+6. The ⚙ button opens the player menu: where each stream came from and its status, the relay's
+   **Start casting**, and a form to play another URL on the big screen (click its title to fold
+   it away). Each stream's **Details** has the full error, the frame totals, how it's decoded,
+   the stream URL, and other technical facts.
+7. To play a URL you already have, click **Open player** at the top of the popup. Then paste the
    stream URL, plus a Referer if the server needs one.
+8. Closed the player? **Reopen last player** at the top of the popup brings back the streams it
+   showed last, until Chrome quits or the extension reloads (links with a token may have
+   expired by then).
 
 The first playlist in the list is usually the master playlist. That's the one to pick. If a page
 loads an ad or a decoy first, try the others.
@@ -117,10 +149,10 @@ and then `[relay] ready`.
 ### Cast
 
 1. Open a stream in the player (**Open in player** in the popup).
-2. Open the ⚙ menu and click **Cast via relay (beta)**. With one stream in the player, it casts
-   that. With two, it casts both as one channel you can swap (see
+2. Open the ⚙ menu and click **Start casting** under **Cast via relay (beta)**. With one stream
+   in the player, it casts that. With two, it casts both as one channel you can swap (see
    [Swap on TV](#swap-on-tv)). The player checks the streams, then shows the cast controls below
-   the buttons.
+   the button.
 3. Click **Cast to TV** and choose your Chromecast.
 
 Playback on your computer stops when the TV takes over, so the stream isn't downloaded twice.
@@ -131,7 +163,7 @@ tab** and cast from there.
 
 ### Swap on TV
 
-With two streams in the player (say a game and a whip-around channel), **Cast via relay** gives
+With two streams in the player (say a game and a whip-around channel), **Start casting** gives
 the TV one channel, and **Swap on TV** in the cast controls switches which stream it shows. The TV
 shows one at a time, full screen.
 
@@ -242,8 +274,10 @@ The player shows the relay address in its status messages, so you can confirm wh
 ```
 extension/        The Chrome extension (load this folder unpacked)
   background.js   Captures playlists and headers; manages header rules
-  popup.*         Toolbar popup listing captured streams
-  player.*        Player tab (big and small picture, ⚙ menu) and the relay fetch loop
+  popup.*         Toolbar popup listing captured streams, with what each offers and its quality check
+  player.*        Player tab (big and small picture, control bar, ⚙ menu) and the relay fetch loop
+  shared.js       hls.js loader (header hosts, disguised segments) used by the player and popup
+  disguise.js     Decodes segments disguised as images
   vendor/         hls.js and its license
 relay/
   server.mjs      The Chromecast relay (Node, no dependencies)
