@@ -85,19 +85,56 @@ function recordError(id, stream, err) {
 
 // Hands a URL to the player tab and waits for it to come back with the response. src says
 // which of the cast's streams it belongs to, so the tab sends that stream's headers.
+//
+// A stream server sometimes never answers one request (seen Nov 2026: a playlist request hung
+// for 20 s while the TV ran dry). So if no answer has come back after each of ASK_AGAIN_MS, the
+// tab is asked again, and the first answer wins.
+const ASK_AGAIN_MS = [4000, 9000];
 function bridgeFetch(stream, url, src = 0) {
   return new Promise((resolve, reject) => {
-    const job = { id: crypto.randomBytes(6).toString('hex'), url, src };
-    const timer = setTimeout(() => {
-      stream.pending.delete(job.id);
-      const i = stream.queue.indexOf(job);
-      if (i >= 0) stream.queue.splice(i, 1);
-      reject(new Error(`the player tab didn't fetch ${url} within ${BRIDGE_TIMEOUT_MS / 1000}s. Keep the Stream Sniffer player tab open; it does the fetching for the relay.`));
-    }, BRIDGE_TIMEOUT_MS);
-    stream.pending.set(job.id, { resolve, timer });
-    const waiter = stream.waiters.shift();
-    if (waiter) waiter(job);
-    else stream.queue.push(job);
+    const jobs = [];
+    const timers = [];
+    let settled = false;
+    const finish = () => {
+      settled = true;
+      timers.forEach(clearTimeout);
+      for (const job of jobs) {
+        stream.pending.delete(job.id);
+        const i = stream.queue.indexOf(job);
+        if (i >= 0) stream.queue.splice(i, 1);
+      }
+    };
+    const ask = () => {
+      const job = { id: crypto.randomBytes(6).toString('hex'), url, src };
+      jobs.push(job);
+      stream.pending.set(job.id, {
+        resolve: (result) => {
+          if (settled) return;
+          finish();
+          resolve(result);
+        },
+      });
+      const waiter = stream.waiters.shift();
+      if (waiter) waiter(job);
+      else stream.queue.push(job);
+    };
+    ask();
+    for (const ms of ASK_AGAIN_MS) {
+      timers.push(
+        setTimeout(() => {
+          if (settled) return;
+          console.log(`[relay] no answer for ${new URL(url).pathname.split('/').pop()} after ${ms / 1000} s; asking the player tab again`);
+          ask();
+        }, ms)
+      );
+    }
+    timers.push(
+      setTimeout(() => {
+        if (settled) return;
+        finish();
+        reject(new Error(`the player tab didn't fetch ${url} within ${BRIDGE_TIMEOUT_MS / 1000}s (asked ${jobs.length} times). Keep the Stream Sniffer player tab open; it does the fetching for the relay.`));
+      }, BRIDGE_TIMEOUT_MS)
+    );
   });
 }
 
@@ -212,6 +249,10 @@ if (!Number.isFinite(HOLD_SECONDS) || HOLD_SECONDS < 0) {
   throw new Error(`RELAY_HOLD_SECONDS must be a number of seconds, 0 or more (got ${JSON.stringify(process.env.RELAY_HOLD_SECONDS)})`);
 }
 
+// How long the TV's playlist request waits for a refresh from the source before it gets what
+// is already listed.
+const REFRESH_WAIT_MS = 1000;
+
 // The parts of a media playlist the channel needs. Throws for features it can't carry over.
 function parseMediaPlaylist(text, base) {
   if (!text.trimStart().startsWith('#EXTM3U')) throw new Error('not an HLS playlist');
@@ -304,7 +345,7 @@ function newChannel() {
     refreshing: null,
     refreshedAt: 0,
     joining: true, // the next refresh is the first from this stream (at the start, or after a swap)
-    reserveSeconds: null, // the reserve in use, once the first refresh has seen the playlist
+    nextListAt: 0, // when the next new segment may be listed to the TV (see refreshChannel)
   };
 }
 
@@ -336,26 +377,35 @@ function refreshChannel(id, stream) {
         ch.pendingSwitch = false;
         ch.switch.firstSeq = ch.nextSeq;
       }
-      // When each segment is listed to the TV: reserveSeconds after the relay first saw it.
-      // Joining a stream, its whole playlist arrives at once, so date those segments as if they
-      // had arrived one by one, the newest now; the older ones are then listed at once.
+      // When each segment is listed to the TV (listAt). The relay paces them: each one when the
+      // one before would have finished playing, never before it arrives, and never more than
+      // HOLD_SECONDS after it arrives. While the source pauses, the reserve (segments not yet
+      // listed) keeps the TV fed at the normal pace and shrinks; the burst that usually follows
+      // a pause refills it.
       const now = Date.now();
-      let seenAt = fresh.map(() => now);
+      let held = 0; // joining: how many of the newest segments start in reserve
+      const joined = ch.joining;
       if (ch.joining) {
-        const total = fresh.reduce((t, x) => t + x.dur, 0);
-        const firstTwo = fresh.slice(0, 2).reduce((t, x) => t + x.dur, 0);
-        ch.reserveSeconds = Math.min(HOLD_SECONDS, Math.max(0, total - firstTwo));
-        let t = now;
-        for (let i = fresh.length - 1; i >= 0; i--) {
-          seenAt[i] = t;
-          t -= fresh[i].dur * 1000;
+        // The TV always gets at least two segments to start with.
+        let heldSeconds = 0;
+        for (let i = fresh.length - 1; i >= 2 && heldSeconds + fresh[i].dur <= HOLD_SECONDS; i--) {
+          held++;
+          heldSeconds += fresh[i].dur;
         }
+        ch.nextListAt = now;
         ch.joining = false;
-        console.log(`[relay] ${id}: keeping ${ch.reserveSeconds.toFixed(1)} s of "${s.label}" in reserve (setting: ${HOLD_SECONDS} s; its playlist lists ${total.toFixed(1)} s)`);
+        const total = fresh.reduce((t, x) => t + x.dur, 0);
+        console.log(`[relay] ${id}: starting "${s.label}" with ${heldSeconds.toFixed(1)} s in reserve (keeps up to ${HOLD_SECONDS} s; its playlist lists ${total.toFixed(1)} s)`);
       }
       for (const [i, x] of fresh.entries()) {
         stream.hosts.add(new URL(x.uri).host);
-        const listAt = seenAt[i] + ch.reserveSeconds * 1000;
+        // Joining: the segments not held start out listed; the held ones follow them, paced.
+        const listAt = joined
+          ? i < fresh.length - held
+            ? now
+            : ch.nextListAt
+          : Math.max(now, Math.min(ch.nextListAt, now + HOLD_SECONDS * 1000));
+        ch.nextListAt = listAt + x.dur * 1000;
         ch.entries.push({ seq: ch.nextSeq++, src, uri: x.uri, dur: x.dur, disc: x.disc, listAt });
         // Fetch reserved segments now, so the TV's request for each is answered from memory.
         if (listAt > now) cachedFetch(id, stream, x.uri, src).catch((err) => recordError(id, stream, `fetching a reserved segment early: ${err.message}`));
@@ -398,12 +448,21 @@ function channelPlaylist(id, ch) {
 async function serveChannel(id, stream, res) {
   const ch = stream.channel;
   const started = Date.now();
-  try {
-    await refreshChannel(id, stream);
-  } catch (err) {
+  // A slow refresh mustn't hold up the TV, which needs only what is already listed: wait at
+  // most REFRESH_WAIT_MS, and let the refresh finish (and report any error) on its own. With
+  // nothing listed yet, there's nothing to answer with, so wait for it.
+  const refresh = refreshChannel(id, stream).then(
+    () => null,
+    (err) => err
+  );
+  const listed = () => ch.entries.some((e) => e.listAt <= Date.now());
+  const err = listed() ? await Promise.race([refresh, new Promise((r) => setTimeout(() => r('slow'), REFRESH_WAIT_MS))]) : await refresh;
+  if (err === 'slow') {
+    refresh.then((late) => late && recordError(id, stream, late.message));
+  } else if (err) {
     // The TV keeps what it has; the error shows in Relay activity. With nothing at all, fail.
     recordError(id, stream, err.message);
-    if (!ch.entries.length) return send(res, 502, err.message, { 'content-type': 'text/plain' });
+    if (!listed()) return send(res, 502, err.message, { 'content-type': 'text/plain' });
   }
   if (ch.switch && ch.switch.firstSeq != null && !ch.switch.tvSawAt) ch.switch.tvSawAt = new Date().toISOString();
   const body = channelPlaylist(id, ch);
@@ -445,7 +504,11 @@ function channelState(stream) {
 
 // What the cast page says about the reserve: the amount in use, or why there is none.
 function reserveState(stream) {
-  if (stream.channel) return { seconds: stream.channel.reserveSeconds ?? HOLD_SECONDS, measured: stream.channel.reserveSeconds != null };
+  if (stream.channel) {
+    const now = Date.now();
+    const held = stream.channel.entries.filter((e) => e.listAt > now).reduce((t, e) => t + e.dur, 0);
+    return { seconds: held, max: HOLD_SECONDS, started: !stream.channel.joining };
+  }
   return { seconds: 0, why: stream.noReserveWhy || 'not set up' };
 }
 
@@ -507,7 +570,7 @@ function nextJob(req, res, stream) {
 async function jobResult(req, res, stream, jobId) {
   const body = await readBody(req);
   const p = stream.pending.get(jobId);
-  if (!p) return sendJson(res, 410, { error: 'job expired (the TV stopped waiting for it)' });
+  if (!p) return sendJson(res, 410, { error: 'job no longer needed (another try answered first, or the TV stopped waiting)' });
   stream.pending.delete(jobId);
   clearTimeout(p.timer);
   const h = (name) => decodeURIComponent(req.headers[name] || '');

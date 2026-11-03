@@ -517,13 +517,14 @@ async function main() {
     const lastStream = async (pl) => streamOf(Buffer.from(await (await tvGet(pl.entries.at(-1).uri)).arrayBuffer()));
     // From one refresh to the next, a segment number must keep pointing at the same segment, in
     // the same stretch of timeline (its discontinuity number), or the TV misplaces it.
-    const assertConsistent = (before, after, what) => {
+    // quiet: for checks repeated in a loop, print nothing when it holds (a failure still throws).
+    const assertConsistent = (before, after, what, { quiet = false } = {}) => {
       const was = new Map(before.entries.map((e) => [e.seq, e]));
       const changed = after.entries.filter((e) => was.has(e.seq) && (was.get(e.seq).uri !== e.uri || was.get(e.seq).discNo !== e.discNo));
-      assert(
-        after.seq >= before.seq && after.discSeq >= before.discSeq && changed.length === 0,
-        `${what}: sequence numbers only move forward (${before.seq} -> ${after.seq}, discontinuity ${before.discSeq} -> ${after.discSeq}) and no segment changed meaning${changed.length ? ` (changed: ${JSON.stringify(changed)})` : ''}`
-      );
+      const holds = after.seq >= before.seq && after.discSeq >= before.discSeq && changed.length === 0;
+      const msg = `${what}: sequence numbers only move forward (${before.seq} -> ${after.seq}, discontinuity ${before.discSeq} -> ${after.discSeq}) and no segment changed meaning${changed.length ? ` (changed: ${JSON.stringify(changed)})` : ''}`;
+      if (quiet && holds) return;
+      assert(holds, msg);
     };
     const swapTo = async (frame, before, expect) => {
       // The ⚙ menu scrolls, and with two streams the cast controls can sit below its fold, as
@@ -673,20 +674,40 @@ async function main() {
     if (firstLoad.includes('#EXT-X-STREAM-INF')) steadyMedia = new URL(firstUri(firstLoad), steadyMedia).href;
     let tvPl = await readPlaylist(steadyMedia);
     assert(tvPl.live && tvPl.entries.length >= 2, `the TV gets a live playlist (${tvPl.entries.length} segments)`);
+    // Reads the TV's playlist every 0.5 s for ms, and returns the longest time it went without a
+    // new segment. Measured by the clock, so a TV request that itself waits counts as time
+    // without video.
+    const longestTvGap = async (ms, what) => {
+      let longest = 0;
+      let lastGrowth = Date.now();
+      const start = Date.now();
+      while (Date.now() - start < ms) {
+        await new Promise((r) => setTimeout(r, 500));
+        const now = await readPlaylist(steadyMedia);
+        assertConsistent(tvPl, now, what, { quiet: true });
+        if (now.entries.at(-1).seq > tvPl.entries.at(-1).seq) {
+          longest = Math.max(longest, Date.now() - lastGrowth);
+          lastGrowth = Date.now();
+        }
+        tvPl = now;
+      }
+      return Math.max(longest, Date.now() - lastGrowth);
+    };
+    // The fixture's segments are 2 s long, so the TV normally gets one every 2 s.
     servers.stallLive(7000);
-    const stallStart = Date.now();
-    const lastAtStall = tvPl.entries.at(-1).seq;
-    while (Date.now() - stallStart < 6500) {
-      await new Promise((r) => setTimeout(r, 500));
-      const now = await readPlaylist(steadyMedia);
-      assertConsistent(tvPl, now, 'a refresh while the source is paused');
-      tvPl = now;
-    }
-    const gained = tvPl.entries.at(-1).seq - lastAtStall;
-    assert(gained >= 2, `during a 7 s pause at the source, the TV's playlist still gained ${gained} new segments (needs 2 or more)`);
+    // Long enough for the pause to reach the TV even if it arrives late (after the reserve).
+    const pauseGap = await longestTvGap(20000, 'a refresh around a pause at the source');
+    assert(pauseGap < 5000, `over 20 s from the start of a 7 s pause at the source, the TV's playlist never went more than 5 s without a new segment (longest: ${(pauseGap / 1000).toFixed(1)} s)`);
     assert((await lastStream(tvPl)) === 'A', 'the newest segment the TV sees is real video from the stream');
-    const reserveNote = await waitForText(steadyFrame, /keeps \d+ s of video in reserve/);
-    ok(`the cast controls say how much video the relay keeps in reserve: "${reserveNote}"`);
+    const reserveNote = await waitForText(steadyFrame, /Reserve: \d+ s of video \(keeps up to \d+ s\)/);
+    ok(`the cast controls say how much video is in reserve now: "${reserveNote}"`);
+
+    // A real stream's playlist server sometimes never answered one request (Nov 2026); the relay
+    // waited 20 s for it while the TV ran dry.
+    step('One live stream: a playlist request the source never answers does not stall the TV');
+    servers.hangNextPlaylist();
+    const hangGap = await longestTvGap(20000, 'a refresh around a hung playlist request');
+    assert(hangGap < 5000, `over 20 s around a hung playlist request, the TV's playlist never went more than 5 s without a new segment (longest: ${(hangGap / 1000).toFixed(1)} s)`);
     await steady.close();
 
     step('Manual mode: paste URL + Referer into the player page');
@@ -789,9 +810,9 @@ async function main() {
 
 // A hang must fail loudly too, not leave the run sitting there.
 const watchdog = setTimeout(() => {
-  console.error('\nFAIL — test did not finish within 120s (hung)');
+  console.error('\nFAIL — test did not finish within 180s (hung)');
   process.exit(1);
-}, 120000);
+}, 180000);
 watchdog.unref();
 
 main().catch((err) => {

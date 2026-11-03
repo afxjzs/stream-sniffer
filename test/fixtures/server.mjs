@@ -187,7 +187,9 @@ self.addEventListener('fetch', (e) => {
   const liveStart = {}; // per live stream: when it was first requested
   let rotation = 0;
   let flakyRefreshes = 0;
-  const stall = { until: 0, edge: 0 }; // /live/stall/: while Date.now() < until, the edge stays put
+  // /live/stall/: while Date.now() < until, the edge stays put; the next `hang` playlist
+  // requests get no answer at all (held open until the server closes).
+  const stall = { until: 0, edge: 0, hang: 0 };
   // allowed: the Referer prefix and CORS origin this CDN accepts.
   const makeCdn = (base, allowed) => http.createServer((req, res) => {
     const url = new URL(req.url, base);
@@ -213,6 +215,10 @@ self.addEventListener('fetch', (e) => {
       if (live[1] === 'flaky' && ++flakyRefreshes === 3) {
         res.writeHead(503, { ...headers, 'content-type': 'text/plain' });
         return res.end('Backend fetch failed');
+      }
+      if (live[1] === 'stall' && stall.hang > 0) {
+        stall.hang--;
+        return; // as a CDN request that never comes back
       }
       liveStart[live[1]] ??= Date.now();
       let edge = Math.floor((Date.now() - liveStart[live[1]]) / 2000) + (live[1] === 'stall' ? 5 : 2);
@@ -296,6 +302,10 @@ self.addEventListener('fetch', (e) => {
     rejected,
     served,
     // Stops /live/stall/ from adding segments for ms milliseconds.
+    // Makes the next /live/stall/ playlist request hang with no answer.
+    hangNextPlaylist: () => {
+      stall.hang++;
+    },
     stallLive: (ms) => {
       stall.until = Date.now() + ms;
     },

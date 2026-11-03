@@ -171,7 +171,11 @@
       ? 'No reserve: this relay was started before the reserve existed. Restart it to get one.'
       : r.why
       ? `No reserve: ${r.why}, so the relay passes its playlists through unchanged.`
-      : `The relay keeps ${Math.round(r.seconds)} s of video in reserve${r.measured ? '' : ' (once the TV starts)'}, so a pause at the stream's source shorter than that doesn't reach the TV. The TV plays that much further behind live.`;
+      : r.max == null
+      ? 'Reserve: this relay is older than this page. Restart it to see how much video is in reserve.'
+      : r.started
+      ? `Reserve: ${Math.round(r.seconds)} s of video (keeps up to ${r.max} s). A pause at the stream's source shorter than the reserve doesn't reach the TV; the reserve refills when the source catches up.`
+      : `Reserve: up to ${r.max} s of video, from when the TV starts.`;
   }
 
   // Poll the relay so it's visible whether the TV is fetching, and what the CDN says.

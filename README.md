@@ -155,12 +155,17 @@ shows one at a time, full screen.
   and any errors from the stream server.
 - **The relay keeps live video in reserve.** Stream sources sometimes stop adding video for a
   few seconds, and the Chromecast plays only a second or two behind the newest segment, so it
-  buffers. For live MPEG-TS streams, the relay lists each new segment to the TV 12 seconds after
-  it appears, and fetches it ahead of time. A pause shorter than the reserve doesn't reach the
-  TV; the cost is that the TV plays that much further behind live. A stream whose playlist is
-  short gets less (the TV always gets at least two segments). The cast controls show the amount
-  in use, or why a stream gets none (on-demand, fMP4, separate audio, or encrypted streams are
-  passed through unchanged).
+  buffers. For live MPEG-TS streams, the relay holds back up to 12 seconds of the newest video
+  (fetched ahead of time) and hands segments to the TV at the pace they play. When the source
+  pauses, the TV keeps getting video from the reserve, which shrinks; when the source catches
+  up, the reserve refills. The cost is that the TV plays up to 12 seconds further behind live.
+  A stream whose playlist is short starts with less (the TV always gets at least two segments).
+  The cast controls show how much is in reserve right now, or why a stream gets none
+  (on-demand, fMP4, separate audio, or encrypted streams are passed through unchanged).
+- **A request the stream server doesn't answer is tried again.** After 4 seconds without an
+  answer, the relay asks the player tab to fetch it again, and again at 9 seconds; the first
+  answer wins. The TV's own playlist requests are answered within about a second from what the
+  relay already has, instead of waiting on a slow source.
 - **The relay keeps each segment for 30 seconds**, because the Chromecast asks for most of them
   twice. The second request is answered from memory instead of fetched again through Chrome.
 
@@ -275,8 +280,10 @@ It checks what a user would see:
   the TV's playlist stays consistent through swaps: segment numbers only move forward and never
   change meaning, including when a swap scrolls off the top. (The jump to live needs a real
   Chromecast, so the test can't cover it.)
-- A live stream whose source stops adding segments for 7 seconds keeps gaining segments in the
-  TV's playlist, from the relay's reserve, and the cast controls say how much is in reserve.
+- A live stream whose source stops adding segments for 7 seconds: the TV's playlist never goes
+  more than 5 seconds without a new segment, and the cast controls say how much is in reserve.
+- The same stream's server leaving one playlist request unanswered: again, never more than 5
+  seconds without a new segment for the TV.
 - Failures, such as a 403 or a relay that isn't running, show up on screen.
 
 To run it you need `ffmpeg` on your PATH. The first run uses it to generate a short test stream.

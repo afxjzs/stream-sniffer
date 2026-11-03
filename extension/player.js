@@ -691,7 +691,9 @@ async function runJob(b, job) {
     const stream = b.cast[job.src ?? 0];
     if (!stream) throw new Error(`the relay asked for stream ${job.src + 1}, but this tab is casting ${b.cast.length}`);
     await allowHost(stream, job.url);
-    const up = await fetch(job.url, { cache: 'no-store' });
+    // A request the stream server never answers would otherwise stay open forever. The relay
+    // has asked again long before this (and gives up at 20 s), so this only frees the connection.
+    const up = await fetch(job.url, { cache: 'no-store', signal: AbortSignal.timeout(25000) });
     body = await up.arrayBuffer();
     headers = {
       'x-upstream-status': String(up.status),
