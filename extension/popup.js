@@ -389,11 +389,13 @@ async function main() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) throw new Error('Could not find the active tab');
   const k = `tab:${tab.id}`;
-  const { [k]: captures = [] } = await chrome.storage.session.get(k);
-  render(captures);
+  // Listen first, then read: a stream captured between the two would otherwise not show until
+  // the popup is reopened.
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'session' && changes[k]) render(changes[k].newValue || []);
   });
+  const { [k]: captures = [] } = await chrome.storage.session.get(k);
+  render(captures);
 }
 
 main().catch((err) => {

@@ -4,7 +4,7 @@
 //
 // Run: cd test && npm install && npm test
 // Artifacts (screenshots) land in test/artifacts/.
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';

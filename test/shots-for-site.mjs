@@ -3,7 +3,7 @@
 //   node shots-for-site.mjs <output dir>
 //   STREAM_DIR=<dir with index.m3u8 + seg*.ts> node shots-for-site.mjs <output dir>
 //     plays your own HLS stream in the player shot instead of the test pattern.
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
