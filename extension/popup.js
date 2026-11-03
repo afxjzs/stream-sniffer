@@ -336,7 +336,7 @@ function streamItem(i) {
   actions.className = 'actions';
   actions.append(
     button('Add to player', () => addToPlayer(latest()).catch((err) => showError('adding to player', err)), 'primary'),
-    button('Open in player', () => openPlayer(latest()).catch((err) => showError('opening player', err))),
+    button('Open in player', () => openPlayer(latest()).catch((err) => showError('opening player', err)), 'primary'),
     button('Check quality', (e) => {
       const btn = e.currentTarget;
       btn.disabled = true;

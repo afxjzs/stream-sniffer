@@ -376,6 +376,33 @@ async function main() {
     [a, b] = await sizes();
     assert(a.area > b.area * 4, 'and S again swaps back');
 
+    // Moving and resizing both pictures makes Chrome skip a frame or two, which isn't a problem
+    // worth a warning (seen Nov 2026: one after every swap). Chrome's skipped-frame count is the
+    // outside world here, and real Chrome adds its own now and then, so from here on this page
+    // reports only the test's count: 2 more for each picture whenever the test says.
+    await player.evaluate(() => {
+      window.extraDrops = 0;
+      for (const v of document.querySelectorAll('video')) {
+        const real = v.getVideoPlaybackQuality.bind(v);
+        v.getVideoPlaybackQuality = () => ({ ...real(), droppedVideoFrames: window.extraDrops });
+      }
+    });
+    // Frames real Chrome skipped before that leave the warning's 10 s window first.
+    await player.waitForFunction(() => !/Frames in the last 10 s/.test(document.getElementById('problems').textContent), { timeout: 15000 });
+    const framesWarned = () => player.$eval('#problems', (e) => /Frames in the last 10 s/.test(e.textContent));
+    await player.keyboard.press('s');
+    await player.evaluate(() => (window.extraDrops += 2));
+    await new Promise((r) => setTimeout(r, 3000)); // the count runs once a second
+    const afterSwap = await player.$eval('#problems', (e) => e.textContent);
+    assert(!/Frames in the last 10 s/.test(afterSwap), `a swap that makes Chrome skip a couple of frames shows no lost-frames warning (over the video: "${afterSwap}")`);
+    await player.evaluate(() => (window.extraDrops += 2));
+    await player.waitForFunction(() => /Frames in the last 10 s/.test(document.getElementById('problems').textContent), { timeout: 5000 });
+    ok('the same skipped frames without a swap still show the warning');
+    await player.click('#problems p.warn .dismiss'); // hidden until the drops stop
+    await player.keyboard.press('s');
+    [a, b] = await sizes();
+    assert(a.area > b.area * 4, 'and S swaps back');
+
     // Hiding the small picture keeps its stream playing, and S still swaps.
     const smallState = () =>
       player.$eval('video.small', (v) => ({ shown: v.checkVisibility({ visibilityProperty: true }), t: v.currentTime, muted: v.muted }));

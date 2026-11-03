@@ -400,6 +400,8 @@ function swap() {
   const sound = !oldBig.video.muted || oldBig.autoMuted;
   oldSmall.video.volume = oldBig.video.volume;
   streams = [oldSmall, oldBig];
+  // Moving and resizing both pictures makes Chrome skip a frame or two; not worth a warning.
+  oldBig.settleFrom = oldSmall.settleFrom = Date.now();
   layout();
   oldBig.video.muted = true;
   oldSmall.video.muted = !sound;
@@ -552,6 +554,7 @@ for (const v of videos) {
   v.addEventListener('playing', () => {
     const s = streamOf(v);
     if (!s) return;
+    s.settleFrom = Date.now(); // starting (or resuming) makes Chrome skip a frame or two
     s.bufferingSince = null;
     s.lastProblem = s.lastProblemShort = '';
     s.problemKind = null;
@@ -655,6 +658,7 @@ function countFrames(v) {
 // itself (timeline gaps the player didn't account for). The last 10 s of them show over the
 // video; totals in the menu.
 const FRAME_WINDOW_MS = 10000;
+const SETTLE_MS = 2000;
 setInterval(() => {
   let changed = false;
   for (const s of streams) {
@@ -665,7 +669,11 @@ setInterval(() => {
     const missing = shown ? Math.max(0, s.gapFrames - newDropped) : 0;
     s.gapFrames = 0;
     if (newDropped || missing) {
-      s.frameEvents.push({ at: Date.now(), dropped: newDropped, missing });
+      // Frames skipped just after a picture starts playing or is swapped (see settleFrom) count in
+      // the menu's totals but not in the warning over the video. The count runs once a second,
+      // so allow 2 s.
+      const settling = Date.now() - (s.settleFrom ?? 0) < SETTLE_MS;
+      if (!settling || missing) s.frameEvents.push({ at: Date.now(), dropped: settling ? 0 : newDropped, missing });
       s.droppedTotal += newDropped;
       s.missingTotal += missing;
       changed = true;
