@@ -21,7 +21,9 @@ const servers = await startServers({
   streamDir,
   hlsJsPath: path.join(extDir, 'vendor/hls.min.js'),
 });
+// The installed Chrome, kept up to date, as in e2e.mjs.
 const browser = await puppeteer.launch({
+  channel: 'chrome',
   headless: true,
   pipe: true,
   enableExtensions: [extDir],

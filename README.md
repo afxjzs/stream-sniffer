@@ -289,8 +289,11 @@ test/
 
 ## Tests
 
-There's one end-to-end test. It loads the extension into Chrome for Testing and runs it against a
-fake site on your machine. The site mimics a real one with three parts: a page, an embedded player
+There's one end-to-end test. It loads the extension into your installed Google Chrome and runs it
+against a fake site on your machine. It uses that Chrome, not the Chrome for Testing build
+Puppeteer downloads, because the installed one keeps itself updated. Puppeteer's build only moves
+when Puppeteer is upgraded, and it had fallen two major versions behind. The test prints the
+Chrome version it ran on. The site mimics a real one with three parts: a page, an embedded player
 from another origin, and a stream server that returns 403 without the right Referer and token.
 
 It checks what a user would see:
@@ -318,9 +321,11 @@ It checks what a user would see:
   more than 5 seconds without a new segment, and the cast controls say how much is in reserve.
 - The same stream's server leaving one playlist request unanswered: again, never more than 5
   seconds without a new segment for the TV.
+- After a newer cast replaces an older one, the relay drops the older cast's unfinished fetches
+  instead of printing false "keep the player tab open" errors about it.
 - Failures, such as a 403 or a relay that isn't running, show up on screen.
 
-To run it you need `ffmpeg` on your PATH. The first run uses it to generate a short test stream.
+To run it you need Google Chrome installed and `ffmpeg` on your PATH. The first run uses it to generate a short test stream.
 
 ```
 cd test

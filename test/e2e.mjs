@@ -137,14 +137,25 @@ function startRelay() {
       proc.kill();
       reject(new Error('relay did not print "ready" within 10s'));
     }, 10000);
+    // What the relay's terminal shows: casts it has replaced, and errors it printed after that
+    // about one of them (a replaced cast is done; an error about it is a false alarm).
+    proc.replaced = new Set();
+    proc.errorsAfterReplaced = [];
     proc.stdout.on('data', (d) => {
       process.stdout.write(`    [relay] ${d}`);
+      for (const [, id] of String(d).matchAll(/\[relay\] (\w+): superseded/g)) proc.replaced.add(id);
       if (String(d).includes('[relay] ready')) {
         clearTimeout(timer);
         resolve(proc);
       }
     });
-    proc.stderr.on('data', (d) => process.stdout.write(`    [relay:err] ${d}`));
+    proc.stderr.on('data', (d) => {
+      process.stdout.write(`    [relay:err] ${d}`);
+      for (const line of String(d).split('\n')) {
+        const id = line.match(/\[relay\] (\w+):/)?.[1];
+        if (id && proc.replaced.has(id)) proc.errorsAfterReplaced.push(line);
+      }
+    });
     proc.on('exit', (code) => {
       clearTimeout(timer);
       reject(new Error(`relay exited with code ${code}`)); // no-op if already resolved
@@ -178,8 +189,12 @@ async function main() {
       throw new Error(`something is already running on ${RELAY} (${strayRelay.slice(0, 60)}). Is a previous test run still alive?`);
     }
 
-    step('Launch Chrome for Testing with the extension');
-    browser = await puppeteer.launch({ headless: HEADLESS, pipe: true, enableExtensions: [extDir] });
+    // The installed Chrome, which keeps itself up to date, rather than the Chrome for Testing
+    // build Puppeteer pins: that one only moves when Puppeteer is upgraded, and fell two major
+    // versions (and their security fixes) behind. Chrome's sandbox stays on.
+    step('Launch the installed Chrome with the extension');
+    browser = await puppeteer.launch({ channel: 'chrome', headless: HEADLESS, pipe: true, enableExtensions: [extDir] });
+    console.log(`  browser: ${await browser.version()} (the installed Chrome)`);
     // browser.extensions() is empty until the extension finishes registering; its service
     // worker starting is the signal that it has.
     await browser.waitForTarget(
@@ -819,6 +834,13 @@ async function main() {
     servers.hangNextPlaylist();
     const hangGap = await longestTvGap(20000, 'a refresh around a hung playlist request');
     assert(hangGap < 5000, `over 20 s around a hung playlist request, the TV's playlist never went more than 5 s without a new segment (longest: ${(hangGap / 1000).toFixed(1)} s)`);
+    // The Swap on TV cast before this one was replaced over 40 s ago, with video still held back
+    // for its TV. The relay drops that work instead of waiting on a player tab that has moved on.
+    assert(relay.replaced.size > 0, `the relay replaced earlier casts (${relay.replaced.size})`);
+    assert(
+      relay.errorsAfterReplaced.length === 0,
+      `the relay printed no errors about a cast after replacing it (${JSON.stringify(relay.errorsAfterReplaced)})`
+    );
     await steady.close();
 
     step('Manual mode: paste URL + Referer into the player page');

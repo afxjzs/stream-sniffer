@@ -77,7 +77,11 @@ function rewritePlaylist(text, base, id, stream) {
     .join('\n');
 }
 
+// Why a replaced cast's unfinished fetches end. Its own "superseded" log line already says how
+// many were dropped, so failures that only repeat this aren't printed again for each fetch.
+const DROPPED = 'dropped: this cast was replaced by a newer one';
 function recordError(id, stream, err) {
+  if (stream.superseded && String(err).includes(DROPPED)) return;
   stream.stats.errors.push({ at: new Date().toISOString(), error: err });
   stream.stats.errors.splice(0, stream.stats.errors.length - 10);
   console.error(`[relay] ${id}: ${err}`);
@@ -92,11 +96,21 @@ function recordError(id, stream, err) {
 const ASK_AGAIN_MS = [4000, 9000];
 function bridgeFetch(stream, url, src = 0) {
   return new Promise((resolve, reject) => {
+    // A replaced cast's player tab has stopped polling for it; nobody would answer.
+    if (stream.superseded) return reject(new Error(`${DROPPED} (${url})`));
     const jobs = [];
     const timers = [];
     let settled = false;
+    // Ends this fetch now when its cast is replaced (see POST /api/streams).
+    const drop = () => {
+      if (settled) return;
+      finish();
+      reject(new Error(`${DROPPED} (${url})`));
+    };
+    stream.inflight.add(drop);
     const finish = () => {
       settled = true;
+      stream.inflight.delete(drop);
       timers.forEach(clearTimeout);
       for (const job of jobs) {
         stream.pending.delete(job.id);
@@ -632,7 +646,12 @@ async function handle(req, res) {
       if (old.superseded) continue;
       old.superseded = true;
       for (const w of old.waiters.splice(0)) w(null);
-      console.log(`[relay] ${oldId}: superseded`);
+      // Its unfinished fetches (e.g. video held back for its TV) would otherwise wait out
+      // BRIDGE_TIMEOUT_MS for a tab that has moved on, then report it as a failure.
+      const dropped = old.inflight.size;
+      for (const drop of [...old.inflight]) drop();
+      old.queue.length = 0;
+      console.log(`[relay] ${oldId}: superseded${dropped ? `; dropped ${dropped} fetch${dropped === 1 ? '' : 'es'} it still had waiting` : ''}`);
     }
     const id = crypto.randomBytes(6).toString('hex');
     streams.set(id, {
@@ -646,6 +665,8 @@ async function handle(req, res) {
       queue: [],
       waiters: [],
       pending: new Map(),
+      inflight: new Set(), // drop() for each unfinished bridgeFetch
+
       bridgeSeenAt: null,
     });
     const what = sources.length > 1 ? `a Swap on TV channel: ${sources.map((s) => `"${s.label}"`).join(' and ')}` : sources[0].url;
