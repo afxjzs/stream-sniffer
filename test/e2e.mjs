@@ -620,6 +620,18 @@ async function main() {
       tSeg.status === 200 && tBytes[0] === 0x47 && tSeg.headers.get('content-type') === 'video/mp2t',
       `relay hands the TV plain MPEG-TS, not the PNG wrapper (${tSeg.status}, first byte 0x${tBytes[0]?.toString(16)}, ${tSeg.headers.get('content-type')})`
     );
+    // Players built on ffmpeg (Jellyfin's Live TV, VLC) refuse segment URLs that don't end in a
+    // media extension, and this site names its segments seg1.image (as a real one did).
+    // Async: the test site's servers run in this process and must keep answering meanwhile.
+    const probe = await new Promise((resolve) =>
+      execFile('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', trickyMedia], { timeout: 30000 }, (err, stdout, stderr) =>
+        resolve({ code: err ? (err.code ?? err.signal) : 0, stdout: stdout.trim(), stderr: stderr.trim() })
+      )
+    );
+    assert(
+      probe.code === 0 && probe.stdout !== '' && probe.stdout.split(/\s+/).every((c) => c === 'h264'),
+      `ffprobe (what Jellyfin uses) reads the cast's video (exit ${probe.code}, "${probe.stdout}"${probe.stderr ? `, ${probe.stderr.slice(0, 300)}` : ''})`
+    );
 
     step('WebP-disguised segments (TS inside a 1x1 WebP\'s EXIF chunk): the player plays them and the relay casts plain MPEG-TS');
     // A real site did this in Nov 2026; the relay sent the WebP bytes to the TV as video/mp2t

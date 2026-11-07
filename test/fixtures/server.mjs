@@ -281,7 +281,9 @@ index.m3u8?token=${TOKEN}
     const disguise = DISGUISES[url.pathname.match(/^\/live\/(\w+)\//)?.[1]];
     const sub = url.pathname.match(/^\/live\/(?:multi\/(hi)|(jitter))\//);
     const dir = sub ? path.join(streamDir, sub[1] ?? sub[2]) : streamDir;
-    const file = path.join(dir, path.basename(url.pathname));
+    // PNG-disguised segments are named like the images they pretend to be (seg1.image), as a
+    // real site's were (Nov 2026); the file behind them is still seg1.ts.
+    const file = path.join(dir, path.basename(url.pathname).replace(/\.image$/, '.ts'));
     if (!url.pathname.startsWith('/live/') || !fs.existsSync(file)) {
       res.writeHead(404);
       return res.end();
@@ -290,6 +292,7 @@ index.m3u8?token=${TOKEN}
     if (file.endsWith('.m3u8')) {
       // Segment URLs need the token too, like real signed CDNs.
       body = body.toString().replace(/^(seg\d+\.ts)$/gm, `$1?token=${TOKEN}`);
+      if (disguise?.[0] === 'image/png') body = body.replace(/^(seg\d+)\.ts\?/gm, '$1.image?');
     }
     if (disguise && !file.endsWith('.m3u8')) {
       const [type, wrap] = disguise;

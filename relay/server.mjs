@@ -56,16 +56,24 @@ const unb64 = (s) => Buffer.from(s, 'base64url').toString('utf8');
 // belongs to (empty for the first), so the player tab fetches it with that stream's headers.
 // The trailing filename (e.g. seg1.ts) is only a hint for players that sniff by extension; the
 // base64 part is what's used.
-function relayPath(id, upstream, src = 0) {
-  const name = (new URL(upstream).pathname.split('/').pop() || 'x').replace(/[^\w.-]/g, '_') || 'x';
+// Extensions ffmpeg's HLS reader accepts for a segment (its allowed_segment_extensions default,
+// ffmpeg 8.1). Players built on ffmpeg, like Jellyfin's Live TV, refuse any other name, and some
+// sites name segments like images (….image, ….png). Such a name gets `.ts` added, or `.m4s` in
+// an fMP4 playlist, which is what is inside: the relay hands disguised segments over as MPEG-TS.
+const MEDIA_EXTS = new Set('3gp aac avi ac3 eac3 flac mkv m3u8 m4a m4s m4v mpg mov mp2 mp3 mp4 mpeg mpegts ogg ogv oga ts vob vtt wav webvtt cmfv cmfa ec3 fmp4'.split(' '));
+function relayPath(id, upstream, src = 0, otherExt = 'ts') {
+  let name = (new URL(upstream).pathname.split('/').pop() || 'x').replace(/[^\w.-]/g, '_') || 'x';
+  if (!MEDIA_EXTS.has(name.split('.').pop().toLowerCase())) name += `.${otherExt}`;
   return `/s/${id}/r${src || ''}/${b64(upstream)}/${name}`;
 }
 
 function rewritePlaylist(text, base, id, stream) {
+  // A master playlist lists playlists; a media playlist lists segments, fMP4 if it has a MAP.
+  const otherExt = /#EXT-X-STREAM-INF/.test(text) ? 'm3u8' : /#EXT-X-MAP/.test(text) ? 'm4s' : 'ts';
   const proxied = (uri) => {
     const abs = new URL(uri, base).href;
     stream.hosts.add(new URL(abs).host);
-    return relayPath(id, abs);
+    return relayPath(id, abs, 0, otherExt);
   };
   return text
     .split(/\r?\n/)
