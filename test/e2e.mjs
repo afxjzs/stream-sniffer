@@ -144,6 +144,8 @@ function startRelay() {
     proc.stdout.on('data', (d) => {
       process.stdout.write(`    [relay] ${d}`);
       for (const [, id] of String(d).matchAll(/\[relay\] (\w+): superseded/g)) proc.replaced.add(id);
+      // The short address it tells you to type into a TV app.
+      proc.nowUrl ??= String(d).match(/http:\/\/\S+\/now\.m3u8/)?.[0];
       if (String(d).includes('[relay] ready')) {
         clearTimeout(timer);
         resolve(proc);
@@ -535,6 +537,12 @@ async function main() {
 
     step('Start the relay; "Cast via relay" shows the cast controls inside the player, with a LAN address for the TV');
     relay = await startRelay();
+    // The short address someone types into a TV app. Before any cast, it says what to do.
+    const nowUrl = relay.nowUrl;
+    assert(nowUrl && !/^http:\/\/(127\.|\[|localhost)/.test(nowUrl), `the relay prints a short LAN address for TV apps (${nowUrl})`);
+    const noCast = await fetch(nowUrl);
+    const noCastText = await noCast.text();
+    assert(noCast.status === 404 && /Start casting/.test(noCastText), `${nowUrl} before any cast -> 404 saying to press Start casting (${noCast.status}: ${noCastText})`);
     await startCasting(player);
     const castFrame = await player.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
     const mediaText = await waitForText(castFrame, /http:\/\/[\d.]+:8789\/\S+/);
@@ -566,6 +574,14 @@ async function main() {
     const foreignRes = await fetch(foreign);
     assert(foreignRes.status === 403, `URL for an unrelated host -> 403 (got ${foreignRes.status})`);
 
+    step('A short fixed address on the LAN, /now.m3u8, plays the current cast');
+    const nowRes = await fetch(nowUrl);
+    const nowText = await nowRes.text();
+    assert(nowRes.status === 200 && nowText === (await (await fetch(mediaUrl)).text()), `${nowUrl} serves the cast's playlist (${nowRes.status})`);
+    const nowSeg = new URL(firstUri(await (await fetch(new URL(firstUri(nowText), nowRes.url))).text()), nowRes.url);
+    const nowSegBytes = new Uint8Array(await (await fetch(nowSeg)).arrayBuffer());
+    assert(nowSegBytes[0] === 0x47, `links in it lead to real video (${nowSegBytes.length} bytes from ${nowSeg.pathname.slice(0, 30)}…)`);
+
     step('Tricky site (service worker + PNG-disguised segments): captured, plays, and casts');
     const tricky = await browser.newPage();
     await tricky.goto(SITE + '/tricky');
@@ -594,6 +610,8 @@ async function main() {
     const trickyFrame = await trickyPlayer.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
     const trickyMedia = (await waitForText(trickyFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
     const tMaster = await (await fetch(trickyMedia)).text();
+    const nowAfter = await (await fetch(nowUrl)).text();
+    assert(nowAfter === tMaster && nowAfter !== nowText, `after a new cast, ${nowUrl} serves the new cast, not the replaced one`);
     const tVariantUrl = new URL(firstUri(tMaster), trickyMedia).href;
     const tSegUrl = new URL(firstUri(await (await fetch(tVariantUrl)).text()), tVariantUrl).href;
     const tSeg = await fetch(tSegUrl);

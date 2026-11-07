@@ -201,6 +201,24 @@ shows one at a time, full screen.
 - **The relay keeps each segment for 30 seconds**, because the Chromecast asks for most of them
   twice. The second request is answered from memory instead of fetched again through Chrome.
 
+### Playing in another app on the TV
+
+Apps like VLC can play the cast instead of a Chromecast. When the relay starts, it prints a
+fixed address for them:
+
+```
+[relay] for a TV app (VLC, Fire TV), open http://192.168.1.20:8788/now.m3u8: it always plays the current cast
+```
+
+Press **Start casting** in the player, then open that address in the app. It always plays the
+newest cast, so the app can keep it saved. Keep the player tab open while you watch, because
+the relay fetches the stream through it. If nothing is casting, the address returns HTTP 404,
+with a message telling you to press Start casting.
+
+Unlike the stream's own URL, this address needs no headers or cookies. The relay fetches
+through Chrome with the right headers and decodes disguised segments first. If you start a new cast while the app is
+playing, reopen the address in the app.
+
 ### Security
 
 The relay listens on your local network so the TV can reach it. To limit what other devices can

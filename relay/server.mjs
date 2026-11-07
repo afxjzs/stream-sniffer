@@ -610,8 +610,24 @@ const castInfo = (id, s) => ({
   reserve: reserveState(s),
 });
 
+// A short, fixed address for whatever is casting now, so a TV app (VLC, a Fire TV player) can
+// keep one URL instead of typing a new long one for every cast.
+const NOW_PATH = '/now.m3u8';
+function currentCast() {
+  const live = [...streams].filter(([, s]) => !s.superseded);
+  return live.length ? live.at(-1) : null;
+}
+
 async function handle(req, res) {
-  const url = new URL(req.url, LAN_BASE);
+  let url = new URL(req.url, LAN_BASE);
+  if (url.pathname === NOW_PATH) {
+    const [id, s] = currentCast() ?? [];
+    if (!s) return send(res, 404, 'Nothing is casting. Press Start casting in the Stream Sniffer player, then open this address again.');
+    if (!s.info) return send(res, 503, 'The cast is still starting (the player tab has not finished checking the stream). Try again in a few seconds.');
+    // Serve the cast's own playlist here. Its links are root-relative (/s/<id>/…), so they
+    // resolve the same from this address.
+    url = new URL(new URL(castInfo(id, s).mediaUrl).pathname, LAN_BASE);
+  }
   const parts = url.pathname.split('/').filter(Boolean);
 
   if (req.method === 'OPTIONS') {
@@ -807,6 +823,7 @@ server.on('error', (err) => {
 server.listen(PORT, '::', async () => {
   console.log(`[relay] listening on port ${PORT}`);
   console.log(`[relay] TV-facing address: ${LAN_BASE}${process.env.RELAY_HOST ? ' (from RELAY_HOST)' : ' (auto-detected; set RELAY_HOST to override)'}`);
+  console.log(`[relay] for a TV app (VLC, Fire TV), open ${LAN_BASE}${NOW_PATH}: it always plays the current cast`);
   if (process.env.RELAY_CHANNEL_WINDOW) console.log(`[relay] Swap on TV lists ${CHANNEL_WINDOW} segments to the TV (from RELAY_CHANNEL_WINDOW; default 12)`);
   if (process.env.RELAY_HOLD_SECONDS) console.log(`[relay] keeps ${HOLD_SECONDS} s of each live stream in reserve (from RELAY_HOLD_SECONDS; default 12)`);
   // Another process bound to just 127.0.0.1 on this port would quietly win "localhost"
