@@ -17,6 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
 import '../extension/disguise.js'; // defines globalThis.StreamSnifferDisguise (shared with the player)
+import { firstTimestamp, shiftTimestamps, wrapTimestamp, TICKS_PER_SECOND } from './ts-time.mjs';
 
 const nodeCodecs = { inflate: async (b) => zlib.inflateSync(b), gunzip: async (b) => zlib.gunzipSync(b) };
 
@@ -368,7 +369,69 @@ function newChannel() {
     refreshedAt: 0,
     joining: true, // the next refresh is the first from this stream (at the start, or after a swap)
     nextListAt: 0, // when the next new segment may be listed to the TV (see refreshChannel)
+    lastRun: null, // the run (see addToRun) its newest segment belongs to
+    runOf: new Map(), // upstream segment URL -> its run
   };
+}
+
+// The TV's clock. A run is a stretch of segments from one stream with no break in between; at
+// a break (a swap, a gap at the source, or a new cast) the next stream's timestamps are
+// unrelated, often hours apart, and players that pace themselves by timestamps (Jellyfin's
+// ffmpeg reads with -re) wait out a jump forward and freeze. So each run's segments are shifted
+// to start where the run before it ended, as listed to the TV. One clock across casts, since
+// /now.m3u8 carries a TV app from one cast to the next.
+const RUN_GAP = 0.1 * TICKS_PER_SECOND; // a little air at each break, rather than any overlap
+let lastRun = null; // the newest run of any cast
+function addToRun(ch, entry) {
+  let run = ch.lastRun;
+  if (!run || entry.disc) {
+    // Where the last run ended: its segments that were listed. Its reserve, never listed (cut
+    // by a swap or a new cast), never reached the TV.
+    const prevEnd = lastRun
+      ? lastRun.startOut + lastRun.entries.filter((e) => e.listAt <= Date.now()).reduce((t, e) => t + e.dur * TICKS_PER_SECOND, 0) + RUN_GAP
+      : 10 * TICKS_PER_SECOND;
+    run = { startOut: wrapTimestamp(Math.round(prevEnd)), entries: [], offset: null };
+    ch.lastRun = lastRun = run;
+  }
+  run.entries.push(entry);
+  ch.runOf.set(entry.uri, run);
+}
+
+// The reserve only works if the relay keeps up with the source. A TV that asks rarely (Jellyfin's
+// ffmpeg reloads the playlist only when it runs low) would otherwise leave the source unread
+// while the reserve is listed out, so a pause at the source then reaches the TV. So a live cast
+// is refreshed on a timer, whatever the TV does (refreshChannel itself limits how often). Its
+// errors are printed once each, not every second.
+function keepRefreshing(id, stream) {
+  clearInterval(stream.refreshTimer);
+  let lastError = null;
+  stream.refreshTimer = setInterval(() => {
+    if (stream.superseded) return clearInterval(stream.refreshTimer);
+    refreshChannel(id, stream).then(
+      () => (lastError = null),
+      (err) => {
+        if (err.message !== lastError) recordError(id, stream, err.message);
+        lastError = err.message;
+      }
+    );
+  }, 1000);
+}
+
+// A channel segment as the TV gets it: shifted onto the TV's clock. The shift is fixed by the
+// run's first segment, so every segment of a run moves by the same amount.
+async function onTvClock(id, stream, run, segment) {
+  run.offset ??= (async () => {
+    const first = run.entries[0];
+    const r = await cachedFetch(id, stream, first.uri, first.src);
+    if (r.error) throw new Error(`can't line up the TV's clock: the first segment of this stretch failed (${r.error})`);
+    const t = firstTimestamp(r.body);
+    if (t == null) throw new Error(`can't line up the TV's clock: ${first.uri} has no timestamps`);
+    return wrapTimestamp(run.startOut - t);
+  })().catch((err) => {
+    run.offset = null; // try again on the next request rather than failing every segment for good
+    throw err;
+  });
+  return shiftTimestamps(segment, await run.offset);
 }
 
 // Adds the active stream's new segments. At most one refresh at a time, and none more often
@@ -428,7 +491,9 @@ function refreshChannel(id, stream) {
             : ch.nextListAt
           : Math.max(now, Math.min(ch.nextListAt, now + HOLD_SECONDS * 1000));
         ch.nextListAt = listAt + x.dur * 1000;
-        ch.entries.push({ seq: ch.nextSeq++, src, uri: x.uri, dur: x.dur, disc: x.disc, listAt });
+        const entry = { seq: ch.nextSeq++, src, uri: x.uri, dur: x.dur, disc: x.disc, listAt };
+        addToRun(ch, entry);
+        ch.entries.push(entry);
         // Fetch reserved segments now, so the TV's request for each is answered from memory.
         if (listAt > now) cachedFetch(id, stream, x.uri, src).catch((err) => recordError(id, stream, `fetching a reserved segment early: ${err.message}`));
       }
@@ -450,24 +515,56 @@ function listedEntries(ch) {
   return ch.entries.slice(0, listed);
 }
 
-function channelPlaylist(id, ch) {
+// view renumbers the playlist for /now.m3u8 (see nowView): segment numbers shifted by seqBase,
+// discontinuity numbers by discBase, and a discontinuity added before segment markSeq.
+function channelPlaylist(id, ch, view = null) {
   const entries = listedEntries(ch);
+  const { seqBase = 0, discBase = 0, markSeq = null } = view ?? {};
+  const marked = (e) => e.disc || e.seq === markSeq;
+  // The added discontinuity counts in DISCONTINUITY-SEQUENCE once its segment has scrolled off.
+  const markGone = markSeq != null && entries[0].seq > markSeq ? 1 : 0;
   const target = Math.max(ch.target, ...entries.map((e) => Math.ceil(e.dur)));
   const lines = [
     '#EXTM3U',
     '#EXT-X-VERSION:3',
     `#EXT-X-TARGETDURATION:${target}`,
-    `#EXT-X-MEDIA-SEQUENCE:${entries[0].seq}`,
-    `#EXT-X-DISCONTINUITY-SEQUENCE:${ch.discSeq}`,
+    `#EXT-X-MEDIA-SEQUENCE:${entries[0].seq + seqBase}`,
+    `#EXT-X-DISCONTINUITY-SEQUENCE:${ch.discSeq + discBase + markGone}`,
   ];
   for (const e of entries) {
-    if (e.disc) lines.push('#EXT-X-DISCONTINUITY');
+    if (marked(e)) lines.push('#EXT-X-DISCONTINUITY');
     lines.push(`#EXTINF:${e.dur.toFixed(3)},`, relayPath(id, e.uri, e.src));
+  }
+  if (view) {
+    // Remembered so the next cast on /now.m3u8 can continue after these numbers.
+    const discs = entries.filter(marked).length;
+    view.lastSeq = entries.at(-1).seq + seqBase;
+    view.lastDisc = ch.discSeq + discBase + markGone + discs;
   }
   return lines.join('\n') + '\n';
 }
 
-async function serveChannel(id, stream, res) {
+// /now.m3u8 is one address that TV apps keep open across casts. Players built on ffmpeg (Jellyfin)
+// ignore segments numbered below ones they've seen, so a new cast's numbers must continue where
+// the last cast's stopped, after a discontinuity (its timestamps start over). One view per cast;
+// the latest one served is what the next cast continues from.
+const nowViews = new Map(); // cast id -> view
+let lastNowView = null;
+function nowView(id, ch) {
+  let view = nowViews.get(id);
+  if (!view) {
+    const first = listedEntries(ch)[0];
+    view = lastNowView
+      ? { seqBase: lastNowView.lastSeq + 1 - first.seq, discBase: lastNowView.lastDisc - ch.discSeq, markSeq: first.seq }
+      : { seqBase: 0, discBase: 0, markSeq: null };
+    nowViews.set(id, view);
+  }
+  lastNowView = view;
+  return view;
+}
+
+// render: builds the playlist body from the channel (default: the cast's own numbering).
+async function serveChannel(id, stream, res, render = (ch) => channelPlaylist(id, ch)) {
   const ch = stream.channel;
   const started = Date.now();
   // A slow refresh mustn't hold up the TV, which needs only what is already listed: wait at
@@ -487,7 +584,7 @@ async function serveChannel(id, stream, res) {
     if (!listed()) return send(res, 502, err.message, { 'content-type': 'text/plain' });
   }
   if (ch.switch && ch.switch.firstSeq != null && !ch.switch.tvSawAt) ch.switch.tvSawAt = new Date().toISOString();
-  const body = channelPlaylist(id, ch);
+  const body = render(ch);
   recordRequest(stream, { file: 'live.m3u8', status: 200, bytes: body.length, ms: Date.now() - started, type: 'application/vnd.apple.mpegurl' });
   send(res, 200, body, { 'content-type': 'application/vnd.apple.mpegurl' });
 }
@@ -499,6 +596,12 @@ function switchChannel(id, stream, res) {
   if (!stream.info) return sendJson(res, 409, { error: 'the streams have not been checked yet' });
   // Segments of the old stream still in reserve never reach the TV; the swap takes effect now.
   const listed = listedEntries(ch);
+  // They leave their run too, or the TV's clock would count them as played (see addToRun).
+  for (const e of ch.entries.slice(listed.length)) {
+    const run = ch.runOf.get(e.uri);
+    if (run) run.entries = run.entries.filter((x) => x !== e);
+    ch.runOf.delete(e.uri);
+  }
   ch.entries = listed;
   ch.nextSeq = listed.length ? listed.at(-1).seq + 1 : ch.nextSeq;
   ch.active = 1 - ch.active;
@@ -628,7 +731,8 @@ function currentCast() {
 
 async function handle(req, res) {
   let url = new URL(req.url, LAN_BASE);
-  if (url.pathname === NOW_PATH) {
+  const viaNow = url.pathname === NOW_PATH;
+  if (viaNow) {
     const [id, s] = currentCast() ?? [];
     if (!s) return send(res, 404, 'Nothing is casting. Press Start casting in the Stream Sniffer player, then open this address again.');
     if (!s.info) return send(res, 503, 'The cast is still starting (the player tab has not finished checking the stream). Try again in a few seconds.');
@@ -669,6 +773,7 @@ async function handle(req, res) {
     for (const [oldId, old] of streams) {
       if (old.superseded) continue;
       old.superseded = true;
+      clearInterval(old.refreshTimer);
       for (const w of old.waiters.splice(0)) w(null);
       // Its unfinished fetches (e.g. video held back for its TV) would otherwise wait out
       // BRIDGE_TIMEOUT_MS for a tab that has moved on, then report it as a failure.
@@ -730,6 +835,7 @@ async function handle(req, res) {
       s.info = result.info;
       const mode = !s.channel ? 'playlists passed through, no reserve' : s.sources.length > 1 ? 'Swap on TV channel' : 'relisted with a reserve';
       console.log(`[relay] ${id}: probe ok (${result.info.live ? 'live' : 'VOD'}, ${result.info.segmentFormat}, ${mode})`);
+      if (s.channel) keepRefreshing(id, s);
       return sendJson(res, 200, castInfo(id, s));
     }
     if (req.method === 'POST' && action === 'switch') return switchChannel(id, s, res);
@@ -747,6 +853,7 @@ async function handle(req, res) {
     if (!stream?.info) return send(res, 404, 'unknown stream (the relay may have restarted)');
     if (stream.superseded) return send(res, 410, SUPERSEDED);
     if (!stream.channel) return send(res, 404, 'this cast has one stream; its playlist is at the media URL the cast page shows');
+    if (viaNow) return serveChannel(parts[1], stream, res, (ch) => channelPlaylist(parts[1], ch, nowView(parts[1], ch)));
     return serveChannel(parts[1], stream, res);
   }
 
@@ -779,6 +886,16 @@ async function handle(req, res) {
       head: r.body && !r.isPlaylist ? r.body.subarray(0, 8).toString('hex') : undefined,
     });
     if (r.error) return send(res, r.status, r.error, { 'content-type': 'text/plain' });
+    let body = r.body;
+    const run = !r.isPlaylist && stream.channel?.runOf.get(upstream);
+    if (run) {
+      try {
+        body = await onTvClock(parts[1], stream, run, r.body);
+      } catch (err) {
+        recordError(parts[1], stream, err.message);
+        return send(res, 502, err.message, { 'content-type': 'text/plain' });
+      }
+    }
     if (!r.isPlaylist) {
       // Whether the TV actually took the whole segment, and how long that took over the network.
       const name = new URL(upstream).pathname.split('/').pop().slice(0, 16);
@@ -789,7 +906,7 @@ async function handle(req, res) {
         else console.error(`[relay] ${parts[1]}: the TV hung up on ${name} after ${ms} ms, before it got all ${r.body.length} B`);
       });
     }
-    return send(res, 200, r.body, { 'content-type': r.type });
+    return send(res, 200, body, { 'content-type': r.type });
   }
 
   send(res, 404, 'not found');

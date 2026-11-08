@@ -200,6 +200,13 @@ shows one at a time, full screen.
   relay already has, instead of waiting on a slow source.
 - **The relay keeps each segment for 30 seconds**, because the Chromecast asks for most of them
   twice. The second request is answered from memory instead of fetched again through Chrome.
+- **The relay reads a live source every second**, whether or not the TV is asking. Some TV
+  apps (Jellyfin) reload the playlist only when they run low, and the reserve depends on the
+  relay keeping up with the source.
+- **The TV sees one continuous clock.** Two streams carry unrelated timestamps, often hours
+  apart. After a swap or a new cast, the relay shifts the new stream's timestamps to continue
+  where the last one stopped. Without this, players that pace themselves by timestamps
+  (Jellyfin's Live TV) froze when the TV moved to a different game.
 
 ### Playing in another app on the TV
 
@@ -216,8 +223,12 @@ the relay fetches the stream through it. If nothing is casting, the address retu
 with a message telling you to press Start casting.
 
 Unlike the stream's own URL, this address needs no headers or cookies. The relay fetches
-through Chrome with the right headers and decodes disguised segments first. If you start a new cast while the app is
-playing, reopen the address in the app.
+through Chrome with the right headers and decodes disguised segments first.
+
+If you start a new cast while the app is playing, the app moves on to it without being reopened.
+This works for live casts, which the relay relists with a reserve. A cast the relay passes
+through unchanged (on-demand, fMP4, separate audio, or encrypted streams) still needs the app to
+reopen the address.
 
 ### Security
 

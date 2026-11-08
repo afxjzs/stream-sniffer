@@ -40,16 +40,66 @@ function assert(cond, msg) {
 // relayed re-streams often have.
 function ensureStreams() {
   makeStream(streamDir, '320x240');
-  makeStream(streamDirB, '320x240', [], { pattern: 'testsrc2', tone: 880 });
+  // Its timestamps start an hour later, like a second real channel's: unrelated to stream A's.
+  makeStream(streamDirB, '320x240', ['-output_ts_offset', '3600'], { pattern: 'testsrc2', tone: 880 });
   makeStream(path.join(streamDir, 'hi'), '1280x720');
   makeStream(path.join(streamDir, 'jitter'), '320x240', [
     '-vf', "settb=1/90000,setpts='(N+if(eq(mod(N\\,4)\\,1)\\,0.45\\,0))/25/TB'",
     '-fps_mode', 'passthrough', '-enc_time_base', '1/90000', '-bf', '0',
   ]);
 }
+// Reads a live HLS address the way Jellyfin's Live TV does: ffmpeg with the flags from its log
+// (Nov 2026), remuxing to fMP4 HLS. grows(n, ms, what) waits for n more video frames and fails,
+// with ffmpeg's last words, if they don't come within ms.
+const readers = [];
+function startJellyfinReader(url) {
+  const out = fs.mkdtempSync(path.join(artifactsDir, 'jellyfin-reader-'));
+  const proc = spawn('ffmpeg', [
+    '-hide_banner', '-loglevel', 'info', '-nostats', '-progress', 'pipe:1',
+    '-analyzeduration', '3000000', '-probesize', '1G',
+    '-re', '-readrate_catchup', '100', '-fflags', '+igndts+genpts', '-f', 'hls', '-i', url,
+    '-map_metadata', '-1', '-sn', '-codec:v:0', 'copy', '-start_at_zero', '-codec:a:0', 'copy', '-bsf:a', 'aac_adtstoasc',
+    '-copyts', '-avoid_negative_ts', 'disabled', '-max_muxing_queue_size', '2048',
+    '-f', 'hls', '-max_delay', '5000000', '-hls_time', '3', '-hls_segment_type', 'fmp4',
+    '-hls_playlist_type', 'event', '-hls_list_size', '0', path.join(out, 'out.m3u8'),
+  ]);
+  const reader = { frames: 0, log: '', exited: null };
+  proc.stdout.on('data', (d) => {
+    for (const [, n] of String(d).matchAll(/^frame=(\d+)/gm)) reader.frames = Number(n);
+  });
+  // Everything ffmpeg says (which segments it opens, what it rejects) goes to ffmpeg.log there.
+  const logFile = fs.createWriteStream(path.join(out, 'ffmpeg.log'));
+  proc.stderr.on('data', (d) => {
+    logFile.write(d);
+    reader.log = (reader.log + d).slice(-1500);
+  });
+  proc.on('exit', (code, signal) => (reader.exited = code ?? signal));
+  reader.stop = () => proc.exitCode == null && proc.kill('SIGKILL');
+  reader.grows = async (n, ms, what) => {
+    const from = reader.frames;
+    const deadline = Date.now() + ms;
+    while (reader.frames < from + n) {
+      if (reader.exited != null || Date.now() > deadline) {
+        throw new Error(
+          `ASSERTION FAILED: a Jellyfin-style ffmpeg reader of ${url} keeps getting video ${what}: it went from frame ${from} to ${reader.frames} in ${ms / 1000} s${reader.exited != null ? ` and exited (${reader.exited})` : ''}. Full ffmpeg log: ${path.join(out, 'ffmpeg.log')}. It ended with:\n${reader.log}`
+        );
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    ok(`a Jellyfin-style ffmpeg reader keeps getting video ${what} (frame ${from} -> ${reader.frames})`);
+  };
+  readers.push(reader);
+  return reader;
+}
+
+// Regenerates the stream when the arguments it was made with change (recorded in made-with.json).
 function makeStream(dir, size, videoArgs = [], { pattern = 'testsrc', tone = 440 } = {}) {
-  if (fs.existsSync(path.join(dir, 'index.m3u8'))) return;
+  const madeWith = JSON.stringify({ size, videoArgs, pattern, tone });
+  const stamp = path.join(dir, 'made-with.json');
+  if (fs.existsSync(path.join(dir, 'index.m3u8')) && fs.existsSync(stamp) && fs.readFileSync(stamp, 'utf8') === madeWith) return;
   step(`Generating ${size} test HLS stream in ${path.relative(path.dirname(streamDir), dir)} with ffmpeg`);
+  // Only this stream's own files: hi/ and jitter/ live inside the main stream's folder.
+  if (fs.existsSync(dir)) for (const f of fs.readdirSync(dir)) if (/^seg\d+\.ts$|^index\.m3u8$|^made-with\.json$/.test(f)) fs.rmSync(path.join(dir, f));
   fs.mkdirSync(dir, { recursive: true });
   const r = spawnSync(
     'ffmpeg',
@@ -68,6 +118,7 @@ function makeStream(dir, size, videoArgs = [], { pattern = 'testsrc', tone = 440
     { stdio: 'inherit' }
   );
   if (r.status !== 0) throw new Error(`ffmpeg failed with exit code ${r.status} (${r.error ?? ''})`);
+  fs.writeFileSync(stamp, madeWith);
 }
 
 // waitForFunction, unlike evaluate, survives navigations: a tab opened by chrome.tabs.create
@@ -671,7 +722,27 @@ async function main() {
     await gif.close();
 
     step('Swap on TV: two live streams cast as one channel, and Swap switches what the TV gets');
-    const hash = (b) => crypto.createHash('sha1').update(b).digest('hex');
+    // The relay moves the TV's segments onto one clock, so a segment is recognized by its
+    // contents with every timestamp (PTS, DTS, PCR) blanked out. Written apart from the relay's
+    // own parser on purpose.
+    const withoutTimestamps = (src) => {
+      const b = Buffer.from(src);
+      for (let p = 0; p + 188 <= b.length; p += 188) {
+        const afc = (b[p + 3] >> 4) & 3;
+        let pay = p + 4;
+        if (afc & 2) {
+          if (b[p + 4] > 0 && b[p + 5] & 0x10) b.fill(0, p + 6, p + 12);
+          pay = p + 5 + b[p + 4];
+        }
+        if (afc & 1 && b[p + 1] & 0x40 && pay + 19 <= p + 188 && b[pay] === 0 && b[pay + 1] === 0 && b[pay + 2] === 1) {
+          const flags = b[pay + 7] >> 6;
+          if (flags & 2) b.fill(0, pay + 9, pay + 14);
+          if (flags === 3) b.fill(0, pay + 14, pay + 19);
+        }
+      }
+      return b;
+    };
+    const hash = (b) => crypto.createHash('sha1').update(withoutTimestamps(b)).digest('hex');
     const segHashes = (dir) => new Set(fs.readdirSync(dir).filter((f) => f.endsWith('.ts')).map((f) => hash(fs.readFileSync(path.join(dir, f)))));
     const [aSegs, bSegs] = [segHashes(streamDir), segHashes(streamDirB)];
     const streamOf = (bytes) => (aSegs.has(hash(bytes)) ? 'A' : bSegs.has(hash(bytes)) ? 'B' : `neither (starts ${bytes.subarray(0, 4).toString('hex')})`);
@@ -812,6 +883,10 @@ async function main() {
     const pl1 = await readPlaylist(chMedia);
     assert(pl1.live && pl1.entries.length >= 2, `the TV gets one live playlist (${pl1.entries.length} segments, no end tag)`);
     assert((await lastStream(pl1)) === 'A', 'it plays the big stream, A');
+    // Jellyfin's Live TV froze when the TV moved to a different game (Nov 2026). It reads the
+    // fixed address with ffmpeg; this runs ffmpeg with the flags from Jellyfin's own log.
+    const jellyfin = startJellyfinReader(relay.nowUrl);
+    await jellyfin.grows(50, 20000, 'before the swap');
     await new Promise((r) => setTimeout(r, 2500)); // a live refresh, before swapping
     const pl1b = await readPlaylist(chMedia);
     assertConsistent(pl1, pl1b, 'a plain refresh');
@@ -820,6 +895,7 @@ async function main() {
     const pl2 = await swapTo(chFrame, pl1b, 'B');
     ok('after Swap on TV, the playlist continues with stream B after a discontinuity');
     assertConsistent(pl1b, pl2, 'the swap to B');
+    await jellyfin.grows(75, 25000, "after the swap to B, whose timestamps are an hour later than A's");
     await waitForText(chFrame, /On TV:.*b\/master\.m3u8/);
     ok('the cast controls say B is on the TV');
 
@@ -835,6 +911,8 @@ async function main() {
     }
     assert(pl4.seq > pl1.seq, `old segments scroll off as live goes on (media sequence ${pl1.seq} -> ${pl4.seq})`);
     assertConsistent(pl3, pl4, 'after a swap scrolls off the top');
+    // What a TV app on the fixed address has seen of this cast, before the next cast replaces it.
+    const nowBefore = await readPlaylist(relay.nowUrl);
     await ch.close();
     await twoLive.close();
 
@@ -857,6 +935,38 @@ async function main() {
     if (firstLoad.includes('#EXT-X-STREAM-INF')) steadyMedia = new URL(firstUri(firstLoad), steadyMedia).href;
     let tvPl = await readPlaylist(steadyMedia);
     assert(tvPl.live && tvPl.entries.length >= 2, `the TV gets a live playlist (${tvPl.entries.length} segments)`);
+
+    // Jellyfin's Live TV froze on every new cast (Nov 2026): the fixed address restarted its
+    // segment numbers, and ffmpeg ignores segments numbered below ones it has seen.
+    const castPrefix = new URL(steadyMedia).pathname.split('/').slice(0, 3).join('/') + '/';
+    let nowNext;
+    for (const deadline = Date.now() + 15000; ; ) {
+      nowNext = await readPlaylist(relay.nowUrl).catch(() => null);
+      if (nowNext?.entries.some((e) => new URL(e.uri).pathname.startsWith(castPrefix))) break;
+      if (Date.now() > deadline) throw new Error(`${relay.nowUrl} never moved to the new cast (${castPrefix}):\n${nowNext?.text}`);
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    assertConsistent(nowBefore, nowNext, `${relay.nowUrl} across a new cast`);
+    const firstNew = nowNext.entries.find((e) => new URL(e.uri).pathname.startsWith(castPrefix));
+    const lastOld = Math.max(...nowBefore.entries.map((e) => e.discNo));
+    assert(
+      firstNew.seq > nowBefore.entries.at(-1).seq && firstNew.discNo > lastOld,
+      `the new cast's segments come after the old ones (number ${nowBefore.entries.at(-1).seq} -> ${firstNew.seq}), after a discontinuity (${lastOld} -> ${firstNew.discNo})`
+    );
+    // The numbering must stay consistent as live goes on, including once that discontinuity
+    // scrolls off the top of the playlist.
+    let nowLater = nowNext;
+    for (const deadline = Date.now() + 20000; nowLater.seq <= firstNew.seq; ) {
+      if (Date.now() > deadline) throw new Error(`the new cast's first segment never scrolled off ${relay.nowUrl}:\n${nowLater.text}`);
+      await new Promise((r) => setTimeout(r, 1000));
+      const next = await readPlaylist(relay.nowUrl);
+      assertConsistent(nowLater, next, `${relay.nowUrl} as live goes on`, { quiet: true });
+      nowLater = next;
+    }
+    assertConsistent(nowNext, nowLater, `${relay.nowUrl} after the new cast's first segment scrolls off`);
+    // The same ffmpeg reader, still open from the Swap on TV cast, as Jellyfin's would be.
+    await jellyfin.grows(75, 25000, 'after a new cast replaces the one it started on');
+    jellyfin.stop();
     // Reads the TV's playlist every 0.5 s for ms, and returns the longest time it went without a
     // new segment. Measured by the clock, so a TV request that itself waits counts as time
     // without video.
@@ -877,6 +987,10 @@ async function main() {
       return Math.max(longest, Date.now() - lastGrowth);
     };
     // The fixture's segments are 2 s long, so the TV normally gets one every 2 s.
+    // With the Jellyfin-style reader above having read this cast, this pause reached the TV every
+    // time (3 of 3 runs, Nov 2026) while the relay read the source only when a TV asked; reading
+    // it on a timer (keepRefreshing) fixed it. How the reader drained the reserve isn't pinned
+    // down: an idle TV alone doesn't (tried: 14 s without a request, reserve intact).
     servers.stallLive(7000);
     // Long enough for the pause to reach the TV even if it arrives late (after the reserve).
     const pauseGap = await longestTvGap(20000, 'a refresh around a pause at the source');
@@ -1182,6 +1296,7 @@ async function main() {
     ok(`player reports: "${badRelayMsg}"`);
 
   } finally {
+    for (const r of readers) r.stop();
     if (relay) relay.kill();
     if (browser) await browser.close();
     await servers.close();
