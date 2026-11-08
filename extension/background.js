@@ -80,36 +80,66 @@ async function tabsForOrigin(origin) {
     .map(([k]) => Number(k.slice('frames:'.length)));
 }
 
+// A playlist whose address doesn't say .m3u8 is still labeled one by its server
+// (application/vnd.apple.mpegurl, audio/x-mpegurl, …). Its request headers are only known
+// before the answer comes, so those of every page fetch are held until it does.
+const PLAYLIST_TYPE = /mpegurl/i;
+const pendingHeaders = new Map(); // requestId -> request headers, until the response or an error
+const PENDING_MAX = 2000; // a safety cap: a request that never ends shouldn't hold memory forever
+const FETCH_TYPES = ['xmlhttprequest', 'other', 'media']; // what a player's playlist fetch can be
+
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
-    if (!M3U8.test(details.url)) return;
     // Our own player's requests also hit .m3u8 URLs; don't record those.
     if (details.initiator?.startsWith('chrome-extension://')) return;
-    const h = Object.fromEntries((details.requestHeaders || []).map((x) => [x.name.toLowerCase(), x.value]));
-    const capture = {
-      url: details.url,
-      referer: h.referer || '',
-      origin: h.origin || '',
-      userAgent: h['user-agent'] || '',
-      headers: h, // everything the browser sent, for the curl command and the relay
-      time: Date.now(),
-    };
-    if (details.tabId >= 0) {
-      enqueue(() => addCapture(details.tabId, capture));
-      return;
-    }
-    enqueue(async () => {
-      const tabs = details.initiator ? await tabsForOrigin(details.initiator) : [];
-      if (!tabs.length) {
-        console.warn('[stream-sniffer] playlist fetched outside any tab, with no matching frame; not listed:', details.url, 'initiator:', details.initiator);
-        return;
-      }
-      for (const tabId of tabs) await addCapture(tabId, { ...capture, viaServiceWorker: true });
-    });
+    if (M3U8.test(details.url)) return recordPlaylist(details, details.requestHeaders);
+    if (!FETCH_TYPES.includes(details.type)) return;
+    if (pendingHeaders.size >= PENDING_MAX) pendingHeaders.delete(pendingHeaders.keys().next().value);
+    pendingHeaders.set(details.requestId, details.requestHeaders || []);
   },
   { urls: ['<all_urls>'] },
   ['requestHeaders', 'extraHeaders'] // extraHeaders is required to see Referer and Origin
 );
+
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    const requestHeaders = pendingHeaders.get(details.requestId);
+    if (!requestHeaders) return;
+    pendingHeaders.delete(details.requestId);
+    const type = details.responseHeaders?.find((x) => x.name.toLowerCase() === 'content-type')?.value ?? '';
+    if (PLAYLIST_TYPE.test(type)) recordPlaylist(details, requestHeaders);
+  },
+  { urls: ['<all_urls>'], types: FETCH_TYPES },
+  ['responseHeaders']
+);
+chrome.webRequest.onErrorOccurred.addListener((details) => pendingHeaders.delete(details.requestId), {
+  urls: ['<all_urls>'],
+  types: FETCH_TYPES,
+});
+
+function recordPlaylist(details, requestHeaders) {
+  const h = Object.fromEntries((requestHeaders || []).map((x) => [x.name.toLowerCase(), x.value]));
+  const capture = {
+    url: details.url,
+    referer: h.referer || '',
+    origin: h.origin || '',
+    userAgent: h['user-agent'] || '',
+    headers: h, // everything the browser sent, for the curl command and the relay
+    time: Date.now(),
+  };
+  if (details.tabId >= 0) {
+    enqueue(() => addCapture(details.tabId, capture));
+    return;
+  }
+  enqueue(async () => {
+    const tabs = details.initiator ? await tabsForOrigin(details.initiator) : [];
+    if (!tabs.length) {
+      console.warn('[stream-sniffer] playlist fetched outside any tab, with no matching frame; not listed:', details.url, 'initiator:', details.initiator);
+      return;
+    }
+    for (const tabId of tabs) await addCapture(tabId, { ...capture, viaServiceWorker: true });
+  });
+}
 
 // A new top-level page load in the tab starts a fresh list; every frame load records its origin.
 chrome.webRequest.onBeforeRequest.addListener(
@@ -121,6 +151,76 @@ chrome.webRequest.onBeforeRequest.addListener(
   },
   { urls: ['<all_urls>'], types: ['main_frame', 'sub_frame'] }
 );
+
+// Playlists a page made itself, which never cross the network (see page-hook.js):
+//   page-playlist {uri}                  from page-bridge.js: a page's player loaded one
+//   page-fetch    {tabId, frameId, url}  from the player or popup: get a fresh copy from that page
+// The Referer and Origin for the stream's segments are what a request from that frame sends by
+// default across origins: its origin.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === 'page-playlist') {
+    if (!sender.tab || sender.frameId == null) {
+      console.warn('[stream-sniffer] page-playlist without a tab or frame; not listed:', msg.uri);
+      return false;
+    }
+    const origin = sender.origin && sender.origin !== 'null' ? sender.origin : new URL(sender.url).origin;
+    enqueue(() =>
+      addCapture(sender.tab.id, {
+        url: msg.uri,
+        referer: origin + '/',
+        origin,
+        userAgent: navigator.userAgent,
+        headers: {},
+        time: Date.now(),
+        viaPage: { tabId: sender.tab.id, frameId: sender.frameId },
+      })
+    );
+    return false;
+  }
+  if (msg?.type === 'page-video') {
+    // A frame whose player plays video through Media Source Extensions: the player can copy it
+    // (see mirror.js). One entry per frame; it follows that frame's newest video.
+    if (!sender.tab || sender.frameId == null) {
+      console.warn('[stream-sniffer] page-video without a tab or frame; not listed');
+      return false;
+    }
+    const host = new URL(sender.url).host || 'this page';
+    enqueue(() =>
+      addCapture(sender.tab.id, {
+        url: `stream-sniffer-video://${host}/frame-${sender.frameId}`,
+        referer: '',
+        origin: '',
+        userAgent: navigator.userAgent,
+        headers: {},
+        time: Date.now(),
+        mime: msg.mime,
+        viaVideo: { tabId: sender.tab.id, frameId: sender.frameId, host },
+      })
+    );
+    return false;
+  }
+  if (msg?.type === 'page-fetch') {
+    fetchFromPage(msg).then(
+      (text) => sendResponse({ ok: true, text }),
+      (err) => sendResponse({ error: err.message })
+    );
+    return true; // async response
+  }
+  return false;
+});
+
+async function fetchFromPage({ tabId, frameId, url }) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) throw new Error("its page was closed. This stream's playlist comes from the game page, so keep that page open; reopen it and open the stream from the popup again");
+  let res;
+  try {
+    res = await chrome.tabs.sendMessage(tabId, { type: 'page-fetch', uri: url }, { frameId });
+  } catch (err) {
+    throw new Error(`its page (${tab.title || tab.url}) is gone or was reloaded (${err.message}). Open the stream from the popup on that page again`);
+  }
+  if (!res?.ok) throw new Error(`its page (${tab.title || tab.url}) couldn't hand over the playlist: ${res?.error ?? 'no answer'}`);
+  return res.text;
+}
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   enqueue(() => chrome.storage.session.remove([key(tabId), framesKey(tabId)]));

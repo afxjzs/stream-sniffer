@@ -21,11 +21,21 @@
     hosts.add(host);
   }
 
+  // A playlist the page made itself (see page-hook.js), fetched from that page through
+  // background.js. viaPage is the capture's { tabId, frameId }.
+  const isWeb = (url) => /^https?:/i.test(url);
+  async function fetchFromPage(viaPage, url) {
+    const res = await chrome.runtime.sendMessage({ type: 'page-fetch', ...viaPage, url });
+    if (!res?.ok) throw new Error(res?.error ?? 'no response from background');
+    return res.text;
+  }
+
   // hls.js loader for every request of one stream: registers the host first (allowHost: url =>
   // Promise), and decodes image-disguised segments (see disguise.js) before the demuxer sees
   // them, calling onDisguised for each. A segment that's an image we can't decode, or a host we
-  // can't register, fails loudly with the reason (onFail: message =>).
-  function makeLoader({ allowHost, onDisguised, onFail }) {
+  // can't register, fails loudly with the reason (onFail: message =>). For a stream whose
+  // playlists come from its page (viaPage), addresses that aren't http(s) are fetched from there.
+  function makeLoader({ allowHost, onDisguised, onFail, viaPage = null }) {
     const unwrapping = (callbacks) => ({
       ...callbacks,
       onSuccess: (response, stats, ctx, details) => {
@@ -54,6 +64,7 @@
     return class extends Hls.DefaultConfig.loader {
       load(context, config, callbacks) {
         this.cancelled = false;
+        if (viaPage && !isWeb(context.url)) return this.loadFromPage(context, unwrapping(callbacks));
         allowHost(context.url).then(
           () => {
             if (!this.cancelled) super.load(context, config, unwrapping(callbacks));
@@ -61,6 +72,31 @@
           (err) => {
             onFail(err.message);
             callbacks.onError({ code: 0, text: err.message }, context, null, this.stats);
+          }
+        );
+      }
+      loadFromPage(context, callbacks) {
+        const stats = this.stats;
+        stats.loading.start = performance.now();
+        if (context.responseType === 'arraybuffer') {
+          // Only playlists come from the page; a segment there would need the bytes carried
+          // through extension messages, which isn't built.
+          const msg = `a segment at ${context.url} would have to come from the page, which isn't supported (only playlists can)`;
+          onFail(msg);
+          return callbacks.onError({ code: 0, text: msg }, context, null, stats);
+        }
+        fetchFromPage(viaPage, context.url).then(
+          (text) => {
+            if (this.cancelled) return;
+            stats.loading.first = stats.loading.end = performance.now();
+            stats.loaded = stats.total = text.length;
+            callbacks.onSuccess({ url: context.url, data: text, code: 200 }, stats, context, null);
+          },
+          (err) => {
+            if (this.cancelled) return;
+            const msg = `Couldn't get the playlist from its page: ${err.message}`;
+            onFail(msg);
+            callbacks.onError({ code: 0, text: msg }, context, null, stats);
           }
         );
       }
@@ -99,5 +135,5 @@
     return mbps >= 1 ? `${mbps.toFixed(1)} Mbps` : `${Math.round(mbps * 1000)} kbps`;
   }
 
-  globalThis.StreamSnifferShared = { allowHost, makeLoader, snapTo, snapFps, bestLevel, rateText, codecName, COMMON_FPS };
+  globalThis.StreamSnifferShared = { allowHost, makeLoader, fetchFromPage, isWeb, snapTo, snapFps, bestLevel, rateText, codecName, COMMON_FPS };
 })();

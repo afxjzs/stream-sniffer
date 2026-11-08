@@ -6,6 +6,7 @@
     "test": "node e2e.mjs"
   },
   "devDependencies": {
-    "puppeteer-core": "25.16.0"
+    "puppeteer-core": "25.16.0",
+    "shaka-player": "5.3.0"
   }
 }

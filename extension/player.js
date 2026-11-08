@@ -19,6 +19,8 @@ let streams = [];
 let pageError = ''; // a problem that isn't about one stream
 const big = () => streams[0];
 const streamOf = (video) => streams.find((s) => s.video === video);
+// Playing something: through hls.js, or a copy of a page's video (see mirror.js).
+const active = (s) => !!(s?.hls || s?.mirror);
 
 const { makeLoader, snapTo, snapFps, bestLevel, rateText, codecName, COMMON_FPS } = StreamSnifferShared;
 
@@ -35,6 +37,7 @@ function loaderFor(stream) {
       stream.loadError = msg; // says more than hls.js's error that follows (see the ERROR handler)
       fail(stream, msg);
     },
+    viaPage: stream.source.viaPage, // its playlists come from its page (see page-hook.js)
   });
 }
 
@@ -182,7 +185,7 @@ setInterval(() => {
   const now = performance.now();
   for (const s of streams) {
     const t = s.video.currentTime;
-    if (!s.hls || s.stopped || s.video.paused || t !== s.lastTime) {
+    if (!active(s) || s.stopped || s.video.paused || t !== s.lastTime) {
       if (s.frozenLogged) {
         const why = t !== s.lastTime ? 'picture moving again' : s.video.paused ? 'freeze over: the video is paused' : 'freeze over: the stream stopped';
         logEvent(s, `${why} after ${((now - s.stuckSince) / 1000).toFixed(1)} s frozen`);
@@ -281,6 +284,7 @@ async function startStream(source, slot, { retries = 0, lastReason = '', manual 
   if (slot === 0) fillForm();
   render();
 
+  if (source.viaVideo) return startCopy(stream);
   if (!Hls.isSupported()) return fail(stream, 'hls.js is not supported in this browser (no Media Source Extensions).');
   const res = await chrome.runtime.sendMessage({
     type: 'stream-headers',
@@ -503,8 +507,31 @@ const retryById = (id) => {
   if (s) retry(s, { manual: true });
 };
 
+// A copy of the video its page plays (see mirror.js): no playlist, no hls.js. Its quality is
+// whatever the page's player picked; it stops with a reason if the page goes.
+function startCopy(stream) {
+  stream.status = 'Connecting to its page…';
+  render();
+  stream.mirror = StreamSnifferMirror.start({
+    video: stream.video,
+    viaVideo: stream.source.viaVideo,
+    onStart: () => {
+      stream.status = "Playing a copy of its page's video";
+      render();
+      startPlayback(stream);
+    },
+    onFail: (msg) => {
+      stream.status = 'Stopped';
+      stream.stopped = true;
+      fail(stream, `Stopped: ${msg}`);
+    },
+  });
+}
+
 async function stopStream(s) {
   clearInterval(s.retryTimer);
+  s.mirror?.stop();
+  s.mirror = null;
   s.hls?.destroy();
   s.hls = null;
   s.video.removeAttribute('src');
@@ -550,7 +577,7 @@ function swap() {
   oldSmall.video.muted = !sound;
   oldBig.autoMuted = oldSmall.autoMuted = false;
   for (const s of streams) {
-    if (s.hls && s.video.paused) s.video.play().catch((err) => fail(s, `video.play() failed: ${err.message}`));
+    if (active(s) && s.video.paused) s.video.play().catch((err) => fail(s, `video.play() failed: ${err.message}`));
   }
   persist();
   fillForm();
@@ -715,7 +742,7 @@ for (const v of videos) {
   // fought in a loop.
   v.addEventListener('pause', () => {
     const s = streamOf(v);
-    if (!s?.hls || v.ended) return; // stopped or replaced on purpose, or the end of a video
+    if (!active(s) || v.ended) return; // stopped or replaced on purpose, or the end of a video
     const now = performance.now();
     const at = new Date().toLocaleTimeString();
     if (now - s.resumedAt < 1000) {
@@ -760,7 +787,7 @@ navigator.mediaSession.setActionHandler('pause', () => {
 });
 navigator.mediaSession.setActionHandler('play', () => {
   for (const s of streams) {
-    if (s.hls) s.video.play().catch((err) => fail(s, `video.play() failed: ${err.message}`));
+    if (active(s)) s.video.play().catch((err) => fail(s, `video.play() failed: ${err.message}`));
   }
 });
 
@@ -815,7 +842,7 @@ const SETTLE_MS = 2000;
 setInterval(() => {
   let changed = false;
   for (const s of streams) {
-    const shown = s.hls && !s.stopped && !document.hidden && !s.video.paused && !(s !== big() && smallHidden);
+    const shown = active(s) && !s.stopped && !document.hidden && !s.video.paused && !(s !== big() && smallHidden);
     const dropped = s.video.getVideoPlaybackQuality().droppedVideoFrames;
     const newDropped = shown && s.droppedSeen != null ? Math.max(0, dropped - s.droppedSeen) : 0;
     s.droppedSeen = dropped;
@@ -1016,6 +1043,7 @@ function streamDetails(s) {
     !s.error && s.bufferingSince && `Buffering since ${s.bufferingSince}, waiting for video data`,
     !s.error && s.bufferingSince && s.lastSkipped && `Last skipped playlist problem ${s.lastSkipped}`,
     s.mode && `Headers: ${s.mode}`,
+    s.source.viaPage && "Playlists come from the game page's own player: keep that page open",
     s.unwrapped && 'Segments are disguised as images; decoding them',
     (s.droppedTotal || s.missingTotal) &&
       `Frames so far: ${s.droppedTotal} skipped by Chrome's video player, ${s.missingTotal} missing from the stream`,
@@ -1254,7 +1282,7 @@ popoutBtn.addEventListener('click', async () => {
   pageError = '';
   try {
     if (document.pictureInPictureElement) await document.exitPictureInPicture();
-    else if (!big()?.hls) failPage('Start a stream first, then pop it out.');
+    else if (!active(big())) failPage('Start a stream first, then pop it out.');
     else await big().video.requestPictureInPicture();
   } catch (err) {
     failPage(`Couldn't pop out the video: ${err.name}: ${err.message}`);
@@ -1306,7 +1334,7 @@ function behindLive(s) {
 
 function renderBar() {
   const s = big();
-  bar.hidden = !s?.hls;
+  bar.hidden = !active(s);
   if (bar.hidden) return closeQualityMenu();
   const v = s.video;
   // Live streams just play (see the 'pause' listener), so there's no pause button; play shows
@@ -1319,7 +1347,7 @@ function renderBar() {
   muteBtn.title = `${muteBtn.ariaLabel} (M)`;
   volumeEl.value = silent ? 0 : v.volume;
 
-  const live = !!s.hls.latestLevelDetails?.live;
+  const live = !!s.hls?.latestLevelDetails?.live;
   liveBtn.hidden = !live;
   timeEl.hidden = live;
   if (live) {
@@ -1332,7 +1360,7 @@ function renderBar() {
   }
 
   // The resolution on screen; with more than one quality it opens the quality menu.
-  const levels = s.hls.levels ?? [];
+  const levels = s.hls?.levels ?? []; // none for a copy of a page's video
   const playing = levels[s.playingLevel];
   // e.g. "1080p60" and "6.2 Mbps"
   resolutionEl.textContent = v.videoHeight ? `${v.videoHeight}p${s.fps || ''}` : playing ? levelName(playing) : '';
@@ -1351,7 +1379,7 @@ function fillQualityMenu(s) {
   const h = s.video.videoHeight;
   const items = [
     { index: -1, name: s.quality < 0 && h ? `Auto (${h}p)` : 'Auto', rate: '' },
-    ...s.hls.levels
+    ...(s.hls?.levels ?? [])
       .map((l, index) => ({ index, name: levelName(l), rate: l.bitrate ? `${(l.bitrate / 1e6).toFixed(1)} Mbps` : '', bitrate: l.bitrate }))
       .sort((a, b) => b.bitrate - a.bitrate),
   ];
@@ -1401,7 +1429,7 @@ playBtn.addEventListener('click', () => {
 });
 function toggleMute() {
   const s = big();
-  if (!s?.hls) return;
+  if (!active(s)) return;
   const v = s.video;
   if (v.muted || v.volume === 0) {
     v.muted = false;
@@ -1414,7 +1442,7 @@ function toggleMute() {
 muteBtn.addEventListener('click', toggleMute);
 volumeEl.addEventListener('input', () => {
   const s = big();
-  if (!s?.hls) return;
+  if (!active(s)) return;
   s.video.volume = Number(volumeEl.value);
   s.video.muted = s.video.volume === 0;
   s.autoMuted = false;
@@ -1465,7 +1493,7 @@ function wake() {
   document.body.classList.remove('idle');
   clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
-    if (big()?.hls && menu.hidden && qualityMenu.hidden && !bar.matches(':hover')) document.body.classList.add('idle');
+    if (active(big()) && menu.hidden && qualityMenu.hidden && !bar.matches(':hover')) document.body.classList.add('idle');
     else wake();
   }, 3000);
 }
@@ -1636,6 +1664,14 @@ relayBtn.addEventListener('click', async () => {
   await relayReady;
   // Two streams in the player: cast both as one channel, big one first, so the TV can swap.
   const cast = streams.slice(0, 2);
+  // The relay fetches every address itself through this tab's plain fetch; a playlist only the
+  // game page can make (see page-hook.js) isn't wired through yet.
+  const pageMade = cast.find((s) => s.source.viaPage || s.source.viaVideo);
+  if (pageMade) {
+    const what = pageMade.source.viaVideo ? "is a copy of its page's video" : "has a playlist made by its page's own player";
+    setRelay(`can't cast ${cast.length > 1 ? 'these streams' : 'this stream'} yet: ${streamLabel(pageMade)} ${what}, and casting via the relay doesn't support that. Use Chrome's own Cast (Fit to TV) instead.`);
+    return;
+  }
   setRelay(
     cast.length > 1
       ? `registering both streams with the relay at ${RELAY}, for Swap on TV…`

@@ -226,6 +226,7 @@ async function main() {
     streamDir,
     streamDirB,
     hlsJsPath: path.join(extDir, 'vendor/hls.min.js'),
+    shakaJsPath: path.join(path.dirname(fileURLToPath(import.meta.url)), 'node_modules/shaka-player/dist/shaka-player.compiled.js'),
   });
   let browser;
   let relay;
@@ -1277,15 +1278,30 @@ async function main() {
       await waitForPlayback(fz, 'stall stream after the freeze', t0 + 14, 40000);
       // The clipboard is the outside world: record what Copy log sends instead.
       const copyLog = async () => {
-        await fz.evaluate(() => (navigator.clipboard.writeText = async (t) => void (window.copiedLog = t)));
+        await fz.evaluate(() => {
+          window.copiedLog = null;
+          navigator.clipboard.writeText = async (t) => void (window.copiedLog = t);
+        });
         if (await fz.$eval('#menu', (m) => m.hidden)) await fz.click('::-p-aria(Settings)');
         await fz.click('::-p-text(Copy log)');
         return fz.waitForFunction(() => window.copiedLog, { timeout: 5000 }).then((h) => h.jsonValue());
       };
-      const log = await copyLog();
+      // Only this player tab's lines: other steps play /live/stall/ too.
+      const tag = await fz.evaluate(() => tabTag);
+      const mine = (log) => log.split('\n').filter((l) => l.includes(`[tab ${tag}]`) && /live\/stall\//.test(l));
+      // When the source catches up, the picture can jump past the mark above at once, before the
+      // player has written that it plays again; so the log is read until that line is in it (or
+      // 10 s pass and the assertions below say what's missing).
+      let log = '';
+      let lines = [];
+      for (let i = 0; i < 10; i++) {
+        log = await copyLog();
+        lines = mine(log);
+        const f = lines.findIndex((l) => /frozen/i.test(l));
+        if (f >= 0 && lines.slice(f + 1).some((l) => /again/i.test(l))) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
       fs.writeFileSync(path.join(artifactsDir, 'freeze-log.txt'), log);
-      // Only this page's lines: other steps play /live/stall/ too.
-      const lines = log.split('\n').filter((l) => /live\/stall\//.test(l));
       const at = lines.findIndex((l) => /frozen/i.test(l));
       assert(at >= 0, `the log has the frozen picture (${lines.length} lines for this stream; see artifacts/freeze-log.txt)`);
       const froze = lines[at];
@@ -1299,6 +1315,107 @@ async function main() {
       assert(after.includes(froze), 'after a reload, the freeze is still in the log');
       ok('the log survives a reload');
       await fz.close();
+    }
+
+    step('A player that makes its playlists inside the page (Shaka with its own vttp:// scheme) is captured, and plays while that page stays open');
+    {
+      const game = await browser.newPage();
+      await game.goto(SITE + '/page-made');
+      const frame = await game.waitForFrame((f) => f.url().startsWith(EMBED) && f.url().includes('shaka=1'));
+      await waitForPlayback(frame, "the page-made embed's own Shaka player");
+      assert(
+        !servers.served.some((u) => u.startsWith('/live/pg/') && u.includes('.m3u8')),
+        'fixture sanity: no .m3u8 address crossed the network for this stream'
+      );
+      ok("the site's own player plays, with no playlist on the network");
+
+      await game.bringToFront();
+      const known = new Set(browser.targets());
+      const popupP = browser.waitForTarget((t) => !known.has(t) && t.url().includes('/popup.html'), { timeout: 5000 });
+      await ext.triggerAction(game);
+      const pop = await (await popupP).asPage();
+      await pop.waitForSelector('::-p-text(games.example)', { timeout: 10000 });
+      ok('the popup lists it');
+      const info = await waitForText(pop, /^(\d+ qualit|Couldn't read|Live|Not live)/, 15000);
+      assert(/^1 quality: 240p · 400 kbps advertised · H\.264 · live$/.test(info), `it reads what the stream offers, through the page ("${info}")`);
+      const note = await waitForText(pop, /keep (its|the) page open/i, 5000).catch(() => '');
+      assert(note, 'it says the page has to stay open for this stream');
+      let item = null;
+      for (const li of await pop.$$('li')) if ((await li.evaluate((el) => el.textContent)).includes('master.m3u8')) item = li;
+      assert(item, 'popup has an entry for the master playlist');
+
+      const playerP = browser.waitForTarget((t) => !known.has(t) && t.url().includes('/player.html'), { timeout: 5000 });
+      await (await item.$('button::-p-text(Open in player)')).click();
+      const pl = await (await playerP).asPage();
+      await pl.bringToFront();
+      const start = await waitForPlayback(pl, 'page-made stream in the extension player', 1, 20000);
+      // Past the 3-segment window (6 s): playback that goes on needs fresh playlists from the page.
+      await waitForPlayback(pl, 'page-made stream, still playing', start + 10, 30000);
+      ok('the extension player plays it, and keeps playing as the page hands it fresh playlists');
+
+      await game.close();
+      const gone = await waitForText(pl, /page .*(closed|gone)/i, 30000);
+      ok(`closing the game page is reported, not a silent freeze: "${gone.slice(0, 160)}"`);
+      await pl.close();
+      if (!pop.isClosed()) await pop.close();
+    }
+
+    step('A playlist whose address has no .m3u8 in it is still captured, by what the server says it is, and plays');
+    {
+      const game = await browser.newPage();
+      await game.goto(SITE + '/no-ext');
+      const frame = await game.waitForFrame((f) => f.url().includes('noext=1'));
+      await waitForPlayback(frame, "the no-.m3u8 embed's own player");
+      await game.bringToFront();
+      const known = new Set(browser.targets());
+      const popupP = browser.waitForTarget((t) => !known.has(t) && t.url().includes('/popup.html'), { timeout: 5000 });
+      await ext.triggerAction(game);
+      const pop = await (await popupP).asPage();
+      await pop.waitForSelector('::-p-text(ct/pl)', { timeout: 10000 });
+      ok('the popup lists live/ct/pl');
+      const playerP = browser.waitForTarget((t) => !known.has(t) && t.url().includes('/player.html'), { timeout: 5000 });
+      await pop.click('button::-p-text(Open in player)');
+      const pl = await (await playerP).asPage();
+      await pl.bringToFront();
+      await waitForPlayback(pl, 'no-.m3u8 stream in the extension player', 2, 20000);
+      ok('and it plays in the extension player');
+      await pl.close();
+      if (!pop.isClosed()) await pop.close();
+      await game.close();
+    }
+
+    step('A page whose playlist nothing on the network gives away: the player plays a live copy of the video the page plays');
+    {
+      const game = await browser.newPage();
+      await game.goto(SITE + '/hidden');
+      const frame = await game.waitForFrame((f) => f.url().includes('hidden=1'));
+      await waitForPlayback(frame, "the hidden-playlist embed's own player");
+      await game.bringToFront();
+      const known = new Set(browser.targets());
+      const popupP = browser.waitForTarget((t) => !known.has(t) && t.url().includes('/popup.html'), { timeout: 5000 });
+      await ext.triggerAction(game);
+      const pop = await (await popupP).asPage();
+      const entry = await waitForText(pop, /video playing in/i, 10000);
+      ok(`the popup lists it: "${entry}"`);
+      assert(!(await pop.$('::-p-text(hid/pl)')), 'fixture sanity: the playlist itself is not listed (nothing gave it away)');
+      const playerP = browser.waitForTarget((t) => !known.has(t) && t.url().includes('/player.html'), { timeout: 5000 });
+      await pop.click('button::-p-text(Open in player)');
+      const pl = await (await playerP).asPage();
+      await pl.bringToFront();
+      const start = await waitForPlayback(pl, 'the copy in the extension player', 1, 20000);
+      // The page's player holds only the live window (6 s); playing well past that needs the copy
+      // to keep receiving what the page's player gets.
+      await waitForPlayback(pl, 'the copy, still playing', start + 10, 30000);
+      ok('the extension player plays the copy, and it keeps up with the live stream');
+      const size = await pl.$eval('video', (v) => [v.videoWidth, v.videoHeight]);
+      assert(size[0] === 320 && size[1] === 240, `it's the page's picture (${size.join('x')})`);
+      const pageVolume = await frame.evaluate(() => document.querySelector('video').volume);
+      assert(pageVolume === 0, `the game page goes silent, so the game isn't heard twice (its volume: ${pageVolume})`);
+      await game.close();
+      const gone = await waitForText(pl, /page .*(closed|gone)/i, 20000);
+      ok(`closing the game page is reported: "${gone.slice(0, 160)}"`);
+      await pl.close();
+      if (!pop.isClosed()) await pop.close();
     }
 
     step('Manual mode without a Referer fails loudly, not silently');

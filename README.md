@@ -23,6 +23,20 @@ them to play the stream anywhere else.
 - **Fit to TV.** For Chrome's own Cast (Chrome menu → Cast this tab): resizes the player window
   so the tab is 16:9 and fills the TV with no black bars. In the player's ⚙ menu. Chrome's
   Cast re-encodes the tab, so the picture is softer than the relay's, but it shows both pictures.
+- **Playlists at addresses without `.m3u8`.** A playlist is also recognized by the type its
+  server labels it with (`application/vnd.apple.mpegurl` and similar), whatever its address.
+- **Players that make their playlists in the page.** Some sites run Shaka Player with their own
+  address scheme (`vttp://…`), so no `.m3u8` ever crosses the network. A small script in each
+  page (`page-hook.js`) notices those playlists and lists them in the popup. The player then
+  asks that page for each playlist refresh, so **the game page has to stay open** while it plays;
+  if it closes, the player says so. VLC, curl and casting via the relay can't use these
+  streams yet, and say so. Chrome's own Cast works.
+- **A copy of the video, when nothing else works.** Whatever a page's player does to hide its
+  stream, it still hands its video to the browser. The page script keeps the latest of that,
+  and the popup lists it as "Video playing in <site>". The player then plays a live copy
+  (`mirror.js`). The page has to stay open and playing. Its sound is turned down while it's
+  copied. The quality is whatever the page's player chose. Casting via the relay can't use it
+  yet; Chrome's own Cast can.
 - **Freeze log.** The player records every frozen picture, stall, error and retry, with how much
   video was buffered and when the source last offered a new segment. It's kept across reloads
   (the last 500 entries). ⚙ → **Copy log** copies it for a bug report. Stream links appear

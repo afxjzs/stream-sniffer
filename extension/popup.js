@@ -56,7 +56,7 @@ async function addToPlayer(c) {
 // rule of its own; see background.js) and reports what it says. A playlist listing qualities
 // says their resolution, often frame rate, and an advertised bitrate; a playlist of a single
 // quality says none of that, so "Check quality" plays it unseen for a few seconds to measure.
-const { allowHost, makeLoader, snapFps, bestLevel, rateText, codecName } = StreamSnifferShared;
+const { allowHost, makeLoader, fetchFromPage, isWeb, snapFps, bestLevel, rateText, codecName } = StreamSnifferShared;
 
 async function withHeaders(c, fn) {
   const streamId = crypto.randomUUID();
@@ -69,7 +69,8 @@ async function withHeaders(c, fn) {
   }
 }
 
-async function fetchPlaylist(streamId, hosts, url) {
+async function fetchPlaylist(c, streamId, hosts, url) {
+  if (c.viaPage && !isWeb(url)) return fetchFromPage(c.viaPage, url);
   await allowHost(streamId, hosts, url);
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -107,13 +108,13 @@ const quality = (height, fps) => (height ? `${height}p${fps ? snapFps(fps) : ''}
 // e.g. "3 qualities, best 1080p60 · 6.0 Mbps advertised · H.264 · live"
 async function describe(c) {
   return withHeaders(c, async (streamId, hosts) => {
-    const { variants, live: mediaLive } = parsePlaylist(await fetchPlaylist(streamId, hosts, c.url), c.url);
+    const { variants, live: mediaLive } = parsePlaylist(await fetchPlaylist(c, streamId, hosts, c.url), c.url);
     if (!variants.length) {
       return `${mediaLive ? 'Live' : 'Not live'} · a single quality; its playlist doesn't list resolution or bitrate. Check quality measures them.`;
     }
     const best = variants[0];
     // Whether it's live is in the quality playlists, not this list; the best one's says.
-    const live = best.url ? parsePlaylist(await fetchPlaylist(streamId, hosts, best.url), best.url).live : null;
+    const live = best.url ? parsePlaylist(await fetchPlaylist(c, streamId, hosts, best.url), best.url).live : null;
     const n = variants.length;
     return [
       n === 1 ? `1 quality: ${quality(best.height, best.fps)}` : `${n} qualities, best ${quality(best.height, best.fps)}`,
@@ -165,6 +166,7 @@ async function checkQuality(c, previewEl) {
             allowHost: (url) => allowHost(streamId, hosts, url),
             onDisguised: () => {},
             onFail: (msg) => (problem = msg),
+            viaPage: c.viaPage,
           }),
           maxBufferLength: 10,
         });
@@ -268,7 +270,7 @@ function render(captures) {
   current = captures;
   if (captures.length < listEl.children.length) listEl.replaceChildren(); // tab navigated: list reset
   if (!captures.length) {
-    statusEl.textContent = 'No .m3u8 streams seen on this tab yet. Start playback on the page; this list updates live.';
+    statusEl.textContent = 'No streams seen on this tab yet. Start playback on the page; this list updates live.';
     return;
   }
   if (statusEl.className !== 'error') statusEl.textContent = '';
@@ -284,8 +286,8 @@ function streamItem(i) {
 
   const name = document.createElement('div');
   name.className = 'name';
-  name.textContent = shortName(c.url);
-  name.title = c.url;
+  name.textContent = c.viaVideo ? `Video playing in ${c.viaVideo.host}` : shortName(c.url);
+  name.title = c.viaVideo ? `${c.viaVideo.host}, ${c.mime}` : c.url;
 
   const more = document.createElement('div');
   more.className = 'more';
@@ -299,18 +301,28 @@ function streamItem(i) {
   if (c.viaServiceWorker) meta.textContent += " · fetched by the page's service worker";
   const copies = document.createElement('div');
   copies.className = 'actions';
-  copies.append(
-    button('Copy URL', (e) => copy(e.currentTarget, latest().url)),
-    button('Copy VLC command', (e) => copy(e.currentTarget, vlcCommand(latest()))),
-    button('Copy curl command', (e) => copy(e.currentTarget, curlCommand(latest())))
-  );
+  if (!c.viaVideo) copies.append(button('Copy URL', (e) => copy(e.currentTarget, latest().url)));
+  // A playlist made by its page, or a copy of its video, has no address VLC or curl could fetch.
+  if (!c.viaPage && !c.viaVideo) {
+    copies.append(
+      button('Copy VLC command', (e) => copy(e.currentTarget, vlcCommand(latest()))),
+      button('Copy curl command', (e) => copy(e.currentTarget, curlCommand(latest())))
+    );
+  }
+  // Said up front, not under ⋯: it decides whether the user can close the game page.
+  const pageNote = document.createElement('div');
+  pageNote.className = 'muted small';
+  pageNote.hidden = !c.viaPage && !c.viaVideo;
+  pageNote.textContent = c.viaVideo
+    ? "A live copy of the video this page's player shows, for sites whose stream can't be seen otherwise. Keep its page open and playing; its sound is turned down there while it's copied."
+    : "Its playlist is made by the page's own player, not fetched from a server: keep its page open while it plays.";
   more.append(url, meta, copies);
 
   // What the playlist says it offers, read when the item appears.
   const info = document.createElement('div');
   info.className = 'quality small';
-  info.textContent = 'Reading the playlist…';
-  queued(() => describe(latest())).then(
+  info.textContent = c.viaVideo ? `Format: ${c.mime}` : 'Reading the playlist…';
+  if (!c.viaVideo) queued(() => describe(latest())).then(
     (text) => (info.textContent = text),
     (err) => {
       info.textContent = `Couldn't read the playlist: ${err.message}`;
@@ -337,7 +349,7 @@ function streamItem(i) {
   actions.append(
     button('Add to player', () => addToPlayer(latest()).catch((err) => showError('adding to player', err)), 'primary'),
     button('Open in player', () => openPlayer(latest()).catch((err) => showError('opening player', err)), 'primary'),
-    button('Check quality', (e) => {
+    c.viaVideo ? '' : button('Check quality', (e) => {
       const btn = e.currentTarget;
       btn.disabled = true;
       checked.hidden = false;
@@ -356,7 +368,7 @@ function streamItem(i) {
     moreBtn
   );
 
-  li.append(name, info, actions, preview, checked, more);
+  li.append(name, info, pageNote, actions, preview, checked, more);
   return li;
 }
 

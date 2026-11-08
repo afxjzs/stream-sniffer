@@ -113,8 +113,14 @@ const DISGUISES = {
 export const LIVE_A_URL = `${CDN}/live/a/master.m3u8?token=${TOKEN}`;
 export const LIVE_B_URL = `${CDN}/live/b/master.m3u8?token=${TOKEN}`;
 
-export function startServers({ streamDir, streamDirB, hlsJsPath }) {
+export function startServers({ streamDir, streamDirB, hlsJsPath, shakaJsPath }) {
   const site = http.createServer((req, res) => {
+    if (req.url.startsWith('/page-made')) {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end(`<!doctype html><title>Page-Made Game</title>
+<h1>Big Game</h1>
+<iframe src="${EMBED}/embed?shaka=1" width="640" height="360" allow="autoplay"></iframe>`);
+    }
     if (req.url.startsWith('/second')) {
       res.writeHead(200, { 'content-type': 'text/html' });
       return res.end(`<!doctype html><title>Second Game</title>
@@ -126,7 +132,15 @@ export function startServers({ streamDir, streamDirB, hlsJsPath }) {
   hls.attachMedia(document.getElementById('v'));
 </script>`);
     }
-    const embedPath = req.url.startsWith('/tricky') ? '/embed?tricky=1' : req.url.startsWith('/two-live') ? '/embed?two=1' : '/embed';
+    const embedPath = req.url.startsWith('/tricky')
+      ? '/embed?tricky=1'
+      : req.url.startsWith('/two-live')
+        ? '/embed?two=1'
+        : req.url.startsWith('/no-ext')
+          ? '/embed?noext=1'
+          : req.url.startsWith('/hidden')
+            ? '/embed?hidden=1'
+            : '/embed';
     res.writeHead(200, { 'content-type': 'text/html' });
     res.end(`<!doctype html><title>Fake Sports Site</title>
 <h1>Big Game</h1>
@@ -137,6 +151,38 @@ export function startServers({ streamDir, streamDirB, hlsJsPath }) {
     if (req.url === '/hls.min.js') {
       res.writeHead(200, { 'content-type': 'text/javascript' });
       return fs.createReadStream(hlsJsPath).pipe(res);
+    }
+    if (req.url === '/shaka.js') {
+      res.writeHead(200, { 'content-type': 'text/javascript' });
+      return fs.createReadStream(shakaJsPath).pipe(res);
+    }
+    if (req.url.includes('shaka=1')) {
+      // Like a real embed (StreamEast "Server 1", Nov 2026): Shaka Player, with playlists that
+      // never cross the network as .m3u8. The page registers its own vttp:// scheme; the list of
+      // qualities is built in the page, and the live playlist comes from an address without
+      // .m3u8 in it. Its segments are plain https links to the CDN.
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end(`<!doctype html><title>embed</title>
+<video id="v" autoplay muted playsinline width="640"></video>
+<script src="/shaka.js"></script>
+<script>
+  shaka.polyfill.installAll();
+  const MASTER = '#EXTM3U\\n#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=320x240,CODECS="avc1.64000d,mp4a.40.2"\\nvideo1_game.m3u8\\n';
+  shaka.net.NetworkingEngine.registerScheme('vttp', (uri) => {
+    const text = uri.endsWith('/master.m3u8')
+      ? Promise.resolve(MASTER)
+      : fetch(${JSON.stringify(`${CDN}/live/pg/pl?token=${TOKEN}`)}).then((r) => {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.text();
+        });
+    return shaka.util.AbortableOperation.notAbortable(
+      text.then((t) => ({ uri, originalUri: uri, data: new TextEncoder().encode(t).buffer, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, status: 200 }))
+    );
+  });
+  const player = new shaka.Player();
+  player.attach(document.getElementById('v')).then(() => player.load('vttp://games.example/live/master.m3u8'))
+    .catch((err) => { document.title = 'shaka failed: ' + (err.code || err.message); console.error(err); });
+</script>`);
     }
     if (req.url === '/sw.js') {
       // Passes every stream request through, so the network request comes from the worker.
@@ -175,7 +221,15 @@ self.addEventListener('fetch', (e) => {
       await new Promise((r) => navigator.serviceWorker.addEventListener('controllerchange', r, { once: true }));
     }` : ''}
     const hls = new Hls();
-    hls.loadSource(${JSON.stringify(tricky ? PNG_MASTER_URL : MASTER_URL)});
+    hls.loadSource(${JSON.stringify(
+      tricky
+        ? PNG_MASTER_URL
+        : req.url.includes('noext=1')
+          ? `${CDN}/live/ct/pl?token=${TOKEN}`
+          : req.url.includes('hidden=1')
+            ? `${CDN}/live/hid/pl?token=${TOKEN}`
+            : MASTER_URL
+    )});
     hls.attachMedia(document.getElementById('v'));
   }
   start();
@@ -211,7 +265,13 @@ self.addEventListener('fetch', (e) => {
     // /live/a/ and /live/b/: plain live streams with different pictures (b is streamDirB).
     // /live/stall/: like a, with a 6-segment window, and its server can stop adding segments for
     // a while (stallLive below), as a real stream's source sometimes does; then it catches up.
-    const live = url.pathname.match(/^\/live\/(rot|flaky|a|b|stall)\/index\.m3u8$/);
+    // /live/pg/pl: like a, but at an address without .m3u8 in it, and with absolute segment
+    // links: the playlist the page-made embed (shaka=1) fetches.
+    // /live/ct/pl: the same, with relative segment links, played by an ordinary hls.js page: a
+    // playlist the browser fetches normally, whose address just doesn't say .m3u8.
+    // /live/hid/pl: like ct, but labeled text/plain: a playlist nothing on the network gives away,
+    // like a site whose delivery library hides it (tvsportslive.fr, Nov 2026).
+    const live = url.pathname.match(/^\/live\/(rot|flaky|a|b|stall)\/index\.m3u8$/) ?? url.pathname.match(/^\/live\/(pg|ct|hid)\/pl$/);
     if (live) {
       if (live[1] === 'flaky' && ++flakyRefreshes === 3) {
         res.writeHead(503, { ...headers, 'content-type': 'text/plain' });
@@ -231,19 +291,21 @@ self.addEventListener('fetch', (e) => {
       const prefix = live[1] === 'rot' ? `p${++rotation}` : 'p0';
       // The 20 s of video loops, and its timestamps restart with it, so each loop is marked as a
       // discontinuity, as a real playlist would. Only a, b, and stall run long enough to loop.
-      const loops = ['a', 'b', 'stall'].includes(live[1]);
+      const loops = ['a', 'b', 'stall', 'pg', 'ct', 'hid'].includes(live[1]);
+      const base = live[1] === 'pg' ? `${CDN}/live/pg/` : '';
       const looped = (sn) => loops && sn > 0 && sn % 10 === 0;
       let body = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:${first}\n`;
       if (loops) body += `#EXT-X-DISCONTINUITY-SEQUENCE:${Math.floor(first / 10)}\n`;
       for (let sn = first; sn <= edge; sn++) {
         // The first segment's own loop is already counted in DISCONTINUITY-SEQUENCE.
         if (looped(sn) && sn !== first) body += '#EXT-X-DISCONTINUITY\n';
-        body += `#EXTINF:2.000,\n${prefix}/seg${sn % 10}.ts?token=${TOKEN}\n`;
+        body += `#EXTINF:2.000,\n${base}${prefix}/seg${sn % 10}.ts?token=${TOKEN}\n`;
       }
-      res.writeHead(200, { ...headers, 'content-type': 'application/vnd.apple.mpegurl' });
+      // /live/hid/pl is labeled plain text, so nothing about its request says "playlist".
+      res.writeHead(200, { ...headers, 'content-type': live[1] === 'hid' ? 'text/plain' : 'application/vnd.apple.mpegurl' });
       return res.end(body);
     }
-    const rotSeg = url.pathname.match(/^\/live\/(rot|flaky|a|b|stall)\/p\d+\/(seg\d+\.ts)$/);
+    const rotSeg = url.pathname.match(/^\/live\/(rot|flaky|a|b|stall|pg|ct|hid)\/p\d+\/(seg\d+\.ts)$/);
     if (rotSeg) {
       res.writeHead(200, { ...headers, 'content-type': 'video/mp2t' });
       return res.end(fs.readFileSync(path.join(rotSeg[1] === 'b' ? streamDirB : streamDir, rotSeg[2])));
