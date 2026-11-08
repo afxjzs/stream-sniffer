@@ -69,6 +69,7 @@ function fail(stream, msg, short = msg) {
   console.error('[stream-sniffer]', msg);
   stream.error = msg;
   stream.errorShort = short;
+  stream.errorIsPause = false; // set by the caller when the error only says it keeps pausing
   render();
 }
 
@@ -336,6 +337,7 @@ function scheduleRetry(s, reason, detail) {
     if (left <= 0) return retry(s, { retries: n, lastReason: reason });
     s.errorShort = `${what}. Retrying in ${left} s (try ${n} of ${total}).`;
     s.error = `${s.errorShort} (${detail})`;
+    s.errorIsPause = false;
     render();
   };
   s.retryTimer = setInterval(tick, 1000);
@@ -556,6 +558,11 @@ for (const v of videos) {
     if (!s) return;
     s.settleFrom = Date.now(); // starting (or resuming) makes Chrome skip a frame or two
     s.bufferingSince = null;
+    // "Keeps pausing" describes the video being stopped; once it plays, that's no longer true.
+    if (s.errorIsPause) {
+      s.error = s.errorShort = '';
+      s.errorIsPause = false;
+    }
     s.lastProblem = s.lastProblemShort = '';
     s.problemKind = null;
     render();
@@ -569,7 +576,9 @@ for (const v of videos) {
     const now = performance.now();
     const at = new Date().toLocaleTimeString();
     if (now - s.resumedAt < 1000) {
-      return fail(s, `The video keeps pausing (again at ${at}, right after the player resumed it). Press play to try again.`);
+      fail(s, `The video keeps pausing (again at ${at}, right after the player resumed it). Press play to try again.`);
+      s.errorIsPause = true; // cleared once it plays again (see 'playing')
+      return;
     }
     s.resumedAt = now;
     s.resumes++;

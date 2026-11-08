@@ -1203,6 +1203,23 @@ async function main() {
     await flaky.click('summary::-p-text(Details)');
     const resumeNote = await waitForText(flaky, /resumed after 1 pause/i);
     ok(`a pause is undone at once and noted in the status: "${resumeNote.slice(0, 160)}"`);
+
+    // A pause again right after that resume is reported, not fought in a loop. Once the video
+    // plays again, the report goes: a real one stayed up 13 minutes over a playing video (Nov 2026).
+    await flaky.click('::-p-aria(Settings)'); // close the menu; problems show over the video
+    await new Promise((r) => setTimeout(r, 1200)); // past the window after the last resume
+    await flaky.evaluate(() => {
+      const v = document.querySelector('video');
+      v.pause();
+      setTimeout(() => v.pause(), 300);
+    });
+    await overlay(/keeps pausing/);
+    ok('a pause right after the resume is reported over the video');
+    const againT = await flaky.evaluate(() => document.querySelector('video').currentTime);
+    await flaky.evaluate(() => document.querySelector('video').play());
+    await waitForPlayback(flaky, 'flaky live stream after pressing play', againT + 1, 5000);
+    const stale = await flaky.evaluate(() => document.getElementById('problems').textContent);
+    assert(!/keeps pausing/.test(stale), `once it plays again, the report is gone (the overlay says: "${stale}")`);
     await flaky.close();
 
     step('A stream whose server stops answering is tried again by itself, and plays again');
