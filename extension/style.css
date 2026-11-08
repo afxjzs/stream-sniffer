@@ -146,6 +146,6 @@ body.player { background: #000; overflow: hidden; }
 .player label.toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 .player label.toggle input { margin: 0; padding: 0; accent-color: var(--accent); }
 .player .actions { display: flex; gap: 6px; flex-wrap: wrap; }
-.player #cast-status:empty { display: none; }
+.player #cast-status:empty, .player #fit-status:empty, .player #log-status:empty { display: none; }
 .player #cast-frame { width: 100%; height: 0; display: block; border: 1px solid var(--border); border-radius: 8px; }
 .player #cast-frame[hidden] { display: none; }

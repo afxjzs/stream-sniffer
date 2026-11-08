@@ -45,11 +45,18 @@
       <p class="muted small">Cast via relay (beta)</p>
       <div class="actions">
         <button id="relay" type="button" title="Experimental: needs the relay running (node relay/server.mjs)">Start casting</button>
+        <button id="fit-tv" type="button" title="For Chrome's own Cast (Chrome menu → Cast): resizes this window so the tab is 16:9 and fills the TV">Fit to TV</button>
       </div>
+      <p id="fit-status" class="muted small"></p>
       <p id="cast-status" class="muted small"></p>
       <!-- The relay's cast page. It can load Google's Cast SDK, which extension pages can't. -->
       <iframe id="cast-frame" hidden title="Cast controls"></iframe>
     </div>
+    <!-- Freezes, stalls, errors and retries, kept across reloads (see the freeze log in player.js). -->
+    <div class="actions">
+      <button id="copy-log" type="button" title="Copies what happened to the streams (freezes, errors, retries), to paste into a bug report">Copy log</button>
+    </div>
+    <p id="log-status" class="muted small"></p>
     <!-- Folds away; the player remembers whether it was left open. -->
     <details id="play-url" open>
       <summary class="muted small">Play a URL on the big screen</summary>

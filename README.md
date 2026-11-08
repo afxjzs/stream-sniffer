@@ -20,6 +20,13 @@ them to play the stream anywhere else.
 - **Copy commands.** One click copies a VLC command or a `curl` command with the captured headers.
 - **Chromecast relay (beta).** Sends the stream to a Chromecast as real video, not a mirrored tab.
   See [Chromecast relay (beta)](#chromecast-relay-beta).
+- **Fit to TV.** For Chrome's own Cast (Chrome menu → Cast this tab): resizes the player window
+  so the tab is 16:9 and fills the TV with no black bars. In the player's ⚙ menu. Chrome's
+  Cast re-encodes the tab, so the picture is softer than the relay's, but it shows both pictures.
+- **Freeze log.** The player records every frozen picture, stall, error and retry, with how much
+  video was buffered and when the source last offered a new segment. It's kept across reloads
+  (the last 500 entries). ⚙ → **Copy log** copies it for a bug report. Stream links appear
+  without their query string, which can hold a token.
 
 ## Requirements
 

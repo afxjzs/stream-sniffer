@@ -378,6 +378,28 @@ async function main() {
     await player.waitForSelector('input[name=url]', { visible: true, timeout: 5000 });
     ok('and opens again with a click');
 
+    step('"Fit to TV" makes the tab 16:9, so a Chrome tab cast fills the TV');
+    {
+      // Start from a shape far from 16:9 (a tall window), so the check can't pass by luck.
+      const session = await player.createCDPSession();
+      const { windowId } = await session.send('Browser.getWindowForTarget');
+      await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+      await session.send('Browser.setWindowBounds', { windowId, bounds: { left: 0, top: 0, width: 900, height: 900 } });
+      await player.waitForFunction(() => Math.abs(innerWidth / innerHeight - 16 / 9) > 0.2, { timeout: 5000 });
+      await session.detach();
+      await player.click('::-p-text(Fit to TV)'); // the menu is still open from the step before
+      await player.waitForFunction(() => Math.abs(innerWidth - (innerHeight * 16) / 9) <= 2, { timeout: 5000 });
+      const size = await player.evaluate(() => ({ w: innerWidth, h: innerHeight, ow: outerWidth, oh: outerHeight, sw: screen.availWidth, sh: screen.availHeight }));
+      assert(size.ow <= size.sw && size.oh <= size.sh, `the window fits on the screen (${size.ow}x${size.oh} on ${size.sw}x${size.sh})`);
+      ok(`the tab is ${size.w}x${size.h}, 16:9`);
+      const said = await waitForText(player, /16:9/, 5000);
+      ok(`the player says so ("${said}")`);
+      assert(
+        await player.$eval('video', (v) => { const r = v.getBoundingClientRect(); return r.width === innerWidth && r.height === innerHeight; }),
+        'the video still covers the whole tab'
+      );
+    }
+
     step('"Pop out" puts the video in a floating picture-in-picture window, and can bring it back');
     await player.click('::-p-aria(Pop out)');
     await player.waitForFunction(() => document.pictureInPictureElement?.tagName === 'VIDEO', { timeout: 5000 });
@@ -1239,6 +1261,45 @@ async function main() {
     const backNote = await waitForText(down, /Back after 1 automatic retry/, 5000);
     ok(`and says it's back: "${backNote}"`);
     await down.close();
+
+    step('A freeze is in the log (⚙ → Copy log), with what the stream was doing, and the log survives a reload');
+    {
+      const fz = await browser.newPage();
+      await fz.goto(`chrome-extension://${ext.id}/player.html`);
+      await fz.type('input[name=url]', MASTER_URL.replace('/live/', '/live/stall/'));
+      await fz.type('input[name=referer]', EMBED + '/');
+      await fz.click('button::-p-text(Play)');
+      await waitForPlayback(fz, 'stall stream before the freeze', 1);
+      // The source stops adding segments, as a real one sometimes does: the picture runs out and
+      // freezes, then the source catches up and it plays again.
+      servers.stallLive(16000);
+      const t0 = await fz.evaluate(() => document.querySelector('video').currentTime);
+      await waitForPlayback(fz, 'stall stream after the freeze', t0 + 14, 40000);
+      // The clipboard is the outside world: record what Copy log sends instead.
+      const copyLog = async () => {
+        await fz.evaluate(() => (navigator.clipboard.writeText = async (t) => void (window.copiedLog = t)));
+        if (await fz.$eval('#menu', (m) => m.hidden)) await fz.click('::-p-aria(Settings)');
+        await fz.click('::-p-text(Copy log)');
+        return fz.waitForFunction(() => window.copiedLog, { timeout: 5000 }).then((h) => h.jsonValue());
+      };
+      const log = await copyLog();
+      fs.writeFileSync(path.join(artifactsDir, 'freeze-log.txt'), log);
+      // Only this page's lines: other steps play /live/stall/ too.
+      const lines = log.split('\n').filter((l) => /live\/stall\//.test(l));
+      const at = lines.findIndex((l) => /frozen/i.test(l));
+      assert(at >= 0, `the log has the frozen picture (${lines.length} lines for this stream; see artifacts/freeze-log.txt)`);
+      const froze = lines[at];
+      ok(`the freeze: "${froze.slice(0, 300)}"`);
+      // What tells a stalled source from a stuck player: no new segment from the source for a while.
+      const newest = Number(froze.match(/newest segment in the playlist appeared ([\d.]+) s ago/)?.[1]);
+      assert(newest >= 3, `it shows the source had offered nothing new for a while (${newest} s)`);
+      assert(lines.slice(at + 1).some((l) => /again/i.test(l)), 'and, after it, that the picture played again');
+      await fz.reload();
+      const after = await copyLog();
+      assert(after.includes(froze), 'after a reload, the freeze is still in the log');
+      ok('the log survives a reload');
+      await fz.close();
+    }
 
     step('Manual mode without a Referer fails loudly, not silently');
     const bad = await browser.newPage();

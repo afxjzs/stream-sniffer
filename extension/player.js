@@ -58,6 +58,7 @@ function hlsLogger(stream) {
       stream.skipped++;
       // The message goes on to quote both playlists; the first line says what was wrong.
       stream.lastSkipped = `${new Date().toLocaleTimeString()}: ${text.split('\n')[0].slice(0, 200)}`;
+      logEvent(stream, `playlist problem skipped: ${text.split('\n')[0].slice(0, 200)}`);
       render();
     },
     error: (...args) => console.error('[stream-sniffer] hls.js:', ...args),
@@ -67,6 +68,7 @@ function hlsLogger(stream) {
 // msg goes in the stream's details in the menu; short (if different) goes over the video.
 function fail(stream, msg, short = msg) {
   console.error('[stream-sniffer]', msg);
+  logEvent(stream, msg);
   stream.error = msg;
   stream.errorShort = short;
   stream.errorIsPause = false; // set by the caller when the error only says it keeps pausing
@@ -75,9 +77,128 @@ function fail(stream, msg, short = msg) {
 
 function failPage(msg) {
   console.error('[stream-sniffer]', msg);
+  logEvent(null, msg);
   pageError = msg;
   render();
 }
+
+// The freeze log (⚙ → Copy log): what happened to the streams (freezes, stalls, errors, retries),
+// each with what the stream was doing at that moment, so a freeze can be looked at after the
+// fact. Every entry is its own storage key, so two player tabs logging at once can't overwrite
+// each other, and a reload keeps them. Past LOG_MAX, the oldest go when a player opens.
+const LOG_PREFIX = 'log:';
+const LOG_MAX = 500;
+const tabTag = crypto.randomUUID().slice(0, 4); // tells apart entries from different player tabs
+let logSeq = 0;
+let logBroken = ''; // why an entry couldn't be saved; Copy log says so
+const logStatus = document.getElementById('log-status');
+
+// Which stream: its place on screen and its link without the query (which may hold a token).
+function streamLabel(s) {
+  const i = streams.indexOf(s);
+  const place = i === 0 ? 'big' : i > 0 ? 'small' : 'gone';
+  let where = s.source?.url ?? '?';
+  try {
+    const u = new URL(where);
+    where = u.host + u.pathname;
+  } catch {
+    // Not a URL: shown as it is.
+  }
+  return `${place} ${where}`;
+}
+
+// What a stream is doing: how much video is buffered past what's on screen, and when new video
+// last arrived. A source that stopped adding segments looks different here from a player that
+// stopped using the ones it has.
+function streamState(s) {
+  const v = s.video;
+  const now = performance.now();
+  let ahead = 0;
+  for (let i = 0; i < v.buffered.length; i++) {
+    if (v.buffered.start(i) <= v.currentTime + 0.1 && v.buffered.end(i) > v.currentTime) ahead = v.buffered.end(i) - v.currentTime;
+  }
+  const ago = (t) => (t ? `${((now - t) / 1000).toFixed(1)} s ago` : 'not yet');
+  return [
+    `${ahead.toFixed(1)} s buffered ahead`,
+    `video at ${v.currentTime.toFixed(1)} s${v.paused ? ' (paused)' : ''}`,
+    `newest segment in the playlist appeared ${ago(s.edgeAt)}`,
+    `last segment downloaded ${ago(s.fragAt)}`,
+    `playlist last loaded ${ago(s.playlistAt)}`,
+    s.fps ? `${s.fps} fps` : '',
+    `status: ${s.status}`,
+  ].filter(Boolean).join('; ');
+}
+
+function logEvent(s, text) {
+  const at = Date.now();
+  const entry = { at, tab: tabTag, who: s ? streamLabel(s) : 'player', text, state: s?.video ? streamState(s) : '' };
+  const key = `${LOG_PREFIX}${String(at).padStart(15, '0')}:${tabTag}:${String(logSeq++).padStart(6, '0')}`;
+  chrome.storage.local.set({ [key]: entry }).catch((err) => {
+    // Not failPage: that logs too, and would go round again.
+    console.error("[stream-sniffer] couldn't save to the freeze log:", err);
+    logBroken = err.message;
+  });
+}
+
+const allLogKeys = async () => {
+  const all = await chrome.storage.local.get(null);
+  return [Object.keys(all).filter((k) => k.startsWith(LOG_PREFIX)).sort(), all];
+};
+allLogKeys()
+  .then(([keys]) => keys.length > LOG_MAX && chrome.storage.local.remove(keys.slice(0, keys.length - LOG_MAX)))
+  .catch((err) => {
+    console.error("[stream-sniffer] couldn't trim the freeze log:", err);
+    logBroken = `trimming it failed: ${err.message}`;
+  });
+logEvent(null, `player opened${location.search ? ` (${location.search.slice(0, 80)})` : ''}`);
+
+function logLine(e) {
+  const d = new Date(e.at);
+  const time = `${d.toLocaleDateString()} ${d.toLocaleTimeString(undefined, { hour12: false })}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+  return `${time} [tab ${e.tab}] [${e.who}] ${e.text}${e.state ? ` | ${e.state}` : ''}`;
+}
+document.getElementById('copy-log').addEventListener('click', async () => {
+  try {
+    const [keys, all] = await allLogKeys();
+    const text = [
+      `Stream Sniffer freeze log, copied ${new Date().toString()}`,
+      `Extension ${chrome.runtime.getManifest().version}; ${navigator.userAgent}`,
+      logBroken && `Warning: some entries couldn't be saved (${logBroken}).`,
+      `${keys.length} entries, oldest first:`,
+      ...keys.map((k) => logLine(all[k])),
+    ].filter(Boolean).join('\n');
+    await navigator.clipboard.writeText(text);
+    logStatus.textContent = `Copied ${keys.length} log entries. Paste them into chat or a bug report.`;
+  } catch (err) {
+    console.error("[stream-sniffer] couldn't copy the freeze log:", err);
+    logStatus.textContent = `Couldn't copy the log: ${err.message}`;
+  }
+});
+
+// A frozen picture doesn't always come with an error or a "waiting" event, so every second each
+// playing stream's video time is checked; stuck for FROZEN_AFTER_S is logged, and so is the end.
+const FROZEN_AFTER_S = 3;
+setInterval(() => {
+  const now = performance.now();
+  for (const s of streams) {
+    const t = s.video.currentTime;
+    if (!s.hls || s.stopped || s.video.paused || t !== s.lastTime) {
+      if (s.frozenLogged) {
+        const why = t !== s.lastTime ? 'picture moving again' : s.video.paused ? 'freeze over: the video is paused' : 'freeze over: the stream stopped';
+        logEvent(s, `${why} after ${((now - s.stuckSince) / 1000).toFixed(1)} s frozen`);
+      }
+      s.stuckSince = null;
+      s.frozenLogged = false;
+      s.lastTime = t;
+      continue;
+    }
+    s.stuckSince ??= now - 1000; // it was last seen moving a second ago
+    if (!s.frozenLogged && now - s.stuckSince >= FROZEN_AFTER_S * 1000) {
+      s.frozenLogged = true;
+      logEvent(s, `picture frozen: the video has been stuck at ${t.toFixed(1)} s for ${FROZEN_AFTER_S} s`);
+    }
+  }
+}, 1000);
 
 // A stream that stops (the server didn't answer, timed out or had an error; the video couldn't
 // be decoded) is tried again by itself after these waits; one that plays again starts the count
@@ -143,8 +264,17 @@ async function startStream(source, slot, { retries = 0, lastReason = '', manual 
     uneven: 0, // share of frames off the stream's beat (uneven timestamps; see countFrames)
     codec: '', // e.g. "avc1.640028", once the first segment says
     hardware: null, // whether the browser can decode it in hardware (see checkHardware)
+    // For the freeze log (performance.now() times; 0 = not yet): see streamState.
+    fragAt: 0, // a video segment last downloaded
+    playlistAt: 0, // the playlist last loaded
+    edgeAt: 0, // the playlist last offered a segment it hadn't before
+    edgeSN: -1,
+    lastTime: -1, // the video's time at the last freeze check, and whether a freeze is logged
+    stuckSince: null,
+    frozenLogged: false,
   };
   streams[slot] = stream;
+  logEvent(stream, `${manual ? 'Retry pressed' : retries ? `automatic retry ${retries}` : 'started'}${slot ? ' (small picture)' : ''}`);
   pageError = '';
   layout();
   persist();
@@ -188,6 +318,7 @@ async function startStream(source, slot, { retries = 0, lastReason = '', manual 
       console.warn('[stream-sniffer] fatal media error, recovering:', detail);
       stream.lastProblem = `${new Date().toLocaleTimeString()}: the video decoder hit a problem (${data.details}); recovering`;
       stream.lastProblemShort = 'The video decoder hit a problem; recovering…';
+      logEvent(stream, `decoder problem, recovering in place: ${detail}`);
       stream.problemKind = null; // over when the video plays again
       render();
       hls.recoverMediaError();
@@ -215,6 +346,7 @@ async function startStream(source, slot, { retries = 0, lastReason = '', manual 
       // hls.js retries these itself, but a stall with no explanation looks like a frozen
       // picture; show the latest one until playback is healthy again.
       console.warn('[stream-sniffer] non-fatal hls.js error:', detail);
+      logEvent(stream, `problem, hls.js retrying it: ${detail}`);
       stream.lastProblem = `${new Date().toLocaleTimeString()}: ${detail} (retrying)`;
       // A stalled buffer already shows as "Buffering…"; failed loads say what's being retried.
       stream.lastProblemShort = data.type === Hls.ErrorTypes.NETWORK_ERROR ? `Reconnecting… (${shortReason(data)})` : '';
@@ -238,6 +370,7 @@ async function startStream(source, slot, { retries = 0, lastReason = '', manual 
   // own figure is only a claim, and a playlist linked directly has none.
   hls.on(Hls.Events.FRAG_LOADED, (_e, { frag, payload }) => {
     if (frag.type !== 'main' || !(frag.duration > 0)) return;
+    stream.fragAt = performance.now();
     stream.firstLevel ??= frag.level;
     // payload is after any unwrapping (see makeLoader in shared.js), so a disguised segment
     // counts as video.
@@ -248,6 +381,13 @@ async function startStream(source, slot, { retries = 0, lastReason = '', manual 
   for (const e of [Hls.Events.MANIFEST_LOADED, Hls.Events.LEVEL_LOADED, Hls.Events.AUDIO_TRACK_LOADED, Hls.Events.SUBTITLE_TRACK_LOADED]) {
     hls.on(e, recovered('playlist'));
   }
+  hls.on(Hls.Events.LEVEL_LOADED, (_e, { details }) => {
+    stream.playlistAt = performance.now();
+    if (details.endSN > stream.edgeSN) {
+      stream.edgeSN = details.endSN;
+      stream.edgeAt = stream.playlistAt;
+    }
+  });
   hls.on(Hls.Events.MANIFEST_PARSED, (_e, { levels }) => {
     stream.levels = levels.length;
     // Start on the best quality, and let Auto drop down if the connection can't keep up, rather
@@ -332,6 +472,7 @@ function scheduleRetry(s, reason, detail) {
   const what = s.retries ? `Retry ${s.retries} of ${total} didn't work: ${reason}` : `The stream stopped: ${reason}`;
   s.status = `Stopped · retrying soon (try ${n} of ${total})`;
   console.error(`[stream-sniffer] ${what}; retrying in ${RETRY_DELAYS_S[s.retries]} s:`, detail);
+  logEvent(s, `${what}; retrying in ${RETRY_DELAYS_S[s.retries]} s (${detail})`);
   const tick = () => {
     const left = Math.ceil((at - Date.now()) / 1000);
     if (left <= 0) return retry(s, { retries: n, lastReason: reason });
@@ -550,6 +691,7 @@ for (const v of videos) {
   v.addEventListener('waiting', () => {
     const s = streamOf(v);
     if (!s) return;
+    if (!s.bufferingSince) logEvent(s, 'buffering: the video is waiting for data');
     s.bufferingSince ??= new Date().toLocaleTimeString();
     render();
   });
@@ -557,6 +699,7 @@ for (const v of videos) {
     const s = streamOf(v);
     if (!s) return;
     s.settleFrom = Date.now(); // starting (or resuming) makes Chrome skip a frame or two
+    if (s.bufferingSince) logEvent(s, `playing again (it had been buffering since ${s.bufferingSince})`);
     s.bufferingSince = null;
     // "Keeps pausing" describes the video being stopped; once it plays, that's no longer true.
     if (s.errorIsPause) {
@@ -582,6 +725,7 @@ for (const v of videos) {
     }
     s.resumedAt = now;
     s.resumes++;
+    logEvent(s, 'paused by something other than the player; resuming');
     s.lastResume = at;
     render();
     v.play().catch((err) => fail(s, `Couldn't resume after a pause: video.play() failed: ${err.message}`));
@@ -1363,6 +1507,56 @@ const relayReady = chrome.storage.local.get('relayUrl').then(({ relayUrl }) => {
     console.log(`[stream-sniffer] using relay at ${RELAY} (from storage, not the default)`);
   }
 });
+// Fit to TV. Chrome's own Cast (Chrome menu → Cast) sends the tab's visible area, so on a 16:9
+// TV a tab of any other shape gets black bars. This sizes the window so the tab is 16:9, as big
+// as fits on its screen, and then checks the result rather than assuming it.
+const fitBtn = document.getElementById('fit-tv');
+const fitStatus = document.getElementById('fit-status');
+const nextResize = (ms) =>
+  new Promise((resolve) => {
+    const done = () => (removeEventListener('resize', done), clearTimeout(t), resolve());
+    const t = setTimeout(done, ms); // no resize at all is checked below, not assumed fine
+    addEventListener('resize', done);
+  });
+async function fitToTv() {
+  let win = await chrome.windows.getCurrent();
+  if (win.state !== 'normal') {
+    // A full-screen or maximized window can't be given a size; leave that state first.
+    await chrome.windows.update(win.id, { state: 'normal' });
+    await nextResize(2000);
+    win = await chrome.windows.getCurrent();
+  }
+  // Window sizes are in screen points, innerWidth in CSS pixels, which page zoom scales.
+  const zoom = await chrome.tabs.getZoom((await chrome.tabs.getCurrent()).id);
+  const frameW = win.width - Math.round(innerWidth * zoom);
+  const frameH = win.height - Math.round(innerHeight * zoom);
+  const maxW = screen.availWidth - frameW;
+  const maxH = screen.availHeight - frameH;
+  const w = Math.floor(Math.min(maxW, (maxH * 16) / 9));
+  const h = Math.round((w * 9) / 16);
+  const width = w + frameW;
+  const height = h + frameH;
+  await chrome.windows.update(win.id, {
+    width,
+    height,
+    left: screen.availLeft + Math.floor((screen.availWidth - width) / 2),
+    top: screen.availTop,
+  });
+  await nextResize(2000);
+  const off = Math.abs(innerWidth - (innerHeight * 16) / 9);
+  if (off > 2) {
+    throw new Error(`asked for a 16:9 tab, but it came out ${innerWidth}x${innerHeight}. Resize the window by hand: wider and shorter until the TV has no bars.`);
+  }
+  fitStatus.textContent = `This tab is now ${innerWidth}x${innerHeight} (16:9), so Chrome's Cast fills the TV.`;
+}
+fitBtn.addEventListener('click', () => {
+  fitStatus.textContent = 'Resizing…';
+  fitToTv().catch((err) => {
+    console.error('[stream-sniffer] Fit to TV failed:', err);
+    fitStatus.textContent = `Fit to TV didn't work: ${err.message}`;
+  });
+});
+
 const relayBtn = document.getElementById('relay');
 const setRelay = (msg) => (castStatus.textContent = `Relay: ${msg}`);
 let bridge = null;
