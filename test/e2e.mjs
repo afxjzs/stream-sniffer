@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { startServers, SITE, EMBED, MASTER_URL, CDN2_MASTER_URL, WEBP_MASTER_URL, GIF_MASTER_URL } from './fixtures/server.mjs';
+import { startServers, SITE, EMBED, MASTER_URL, LIVE_A_URL, LIVE_B_URL, CDN2_MASTER_URL, WEBP_MASTER_URL, GIF_MASTER_URL } from './fixtures/server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const extDir = path.resolve(here, '../extension');
@@ -1626,6 +1626,49 @@ async function main() {
     const gaveUp = await waitForText(garbled, /^Stopped after 3 automatic retries: the server sent something that isn't a playlist\. Press Retry/, 60000);
     ok(`"${gaveUp.slice(0, 110)}…"`);
     assert(await garbled.$('#problems .retry'), 'with a Retry button');
+
+    // couch-director feeds two games to its compositor at once: a player tab per slot
+    // (player.html?slot=N), each with its own cast, where a new cast replaces only its slot's.
+    step('Two player tabs cast at once, one per slot: both keep feeding, and a new cast replaces only its own slot\'s');
+    const castInSlot = async (slot, url) => {
+      const p = await browser.newPage();
+      await p.goto(`chrome-extension://${ext.id}/player.html?slot=${slot}`);
+      await p.type('input[name=url]', url);
+      await p.type('input[name=referer]', EMBED + '/');
+      await p.click('button::-p-text(Play)');
+      await waitForPlayback(p, `player in slot ${slot}`);
+      await startCasting(p);
+      const frame = await p.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 15000 });
+      let media = (await waitForText(frame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
+      const first = await (await tvGet(media)).text();
+      if (first.includes('#EXT-X-STREAM-INF')) media = new URL(firstUri(first), media).href;
+      const id = new URL(frame.url()).pathname.split('/')[2];
+      return { page: p, media, id };
+    };
+    // Whether each cast still feeds: its playlist gets a new segment within 8 s (they're 2 s long).
+    const keepsFeeding = async (cast) => {
+      const before = await readPlaylist(cast.media);
+      for (const deadline = Date.now() + 8000; Date.now() < deadline; await new Promise((r) => setTimeout(r, 500))) {
+        if ((await readPlaylist(cast.media)).entries.at(-1).seq > before.entries.at(-1).seq) return true;
+      }
+      return false;
+    };
+    const castState = async () => Object.fromEntries((await (await fetch(`${RELAY}/api/streams`)).json()).map((c) => [c.id, c]));
+    const slot0 = await castInSlot(0, LIVE_A_URL);
+    const slot1 = await castInSlot(1, LIVE_B_URL);
+    let casts = await castState();
+    assert(!casts[slot0.id].superseded && !casts[slot1.id].superseded, 'both slots\' casts are live at once');
+    assert((await keepsFeeding(slot0)) && (await keepsFeeding(slot1)), 'and both playlists keep getting new segments');
+    const slot0b = await castInSlot(0, LIVE_A_URL);
+    casts = await castState();
+    assert(casts[slot0.id].superseded, 'a new cast in slot 0 replaces slot 0\'s old one');
+    assert(!casts[slot1.id].superseded && !casts[slot0b.id].superseded, 'slot 1\'s cast and the new slot 0 cast stay live');
+    assert((await keepsFeeding(slot1)) && (await keepsFeeding(slot0b)), 'and both keep getting new segments');
+    // A slot is 0 or 1; anything else says so instead of quietly casting slotless.
+    const badSlot = await browser.newPage();
+    await badSlot.goto(`chrome-extension://${ext.id}/player.html?slot=2`);
+    ok(`player.html?slot=2: "${await waitForText(badSlot, /slot is 0 or 1/i)}"`);
+    for (const p of [slot0.page, slot1.page, slot0b.page, badSlot]) await p.close();
 
     step('"Cast via relay" with headers the CDN rejects reports the 403 instead of casting a dead URL');
     await startCasting(bad);

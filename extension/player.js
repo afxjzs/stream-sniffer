@@ -10,6 +10,10 @@ const castStatus = document.getElementById('cast-status');
 const resolutionEl = document.getElementById('resolution');
 const bitrateEl = document.getElementById('bitrate');
 const params = new URLSearchParams(location.search);
+// ?slot=0 or 1: which of couch-director's two slots this tab casts to. The relay then keeps this
+// tab's cast alongside the other slot's, replacing only its own slot's. Without it, a cast
+// replaces every other one, as on the Mac. Checked in init().
+const SLOT = params.get('slot');
 const videos = [...document.querySelectorAll('video')];
 
 // The streams on screen, big one first. The page shows at most two (one fills the tab, one
@@ -1418,7 +1422,8 @@ async function loadSource(capId) {
 // or the extension reloads.
 function persist() {
   const caps = streams.map((s) => s.source.capId);
-  history.replaceState(null, '', `?${new URLSearchParams(caps.map((id) => ['cap', id]))}`);
+  const kept = [...(SLOT !== null ? [['slot', SLOT]] : []), ...caps.map((id) => ['cap', id])];
+  history.replaceState(null, '', `?${new URLSearchParams(kept)}`);
   if (!caps.length) return;
   chrome.storage.session.set({ lastSession: caps }).catch((err) => failPage(`Couldn't save this session for reopening: ${err.message}`));
 }
@@ -1845,7 +1850,7 @@ relayBtn.addEventListener('click', async () => {
     res = await fetch(`${RELAY}/api/streams`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sources: cast.map((x) => ({ url: x.source.url, label: castLabel(x) })) }),
+      body: JSON.stringify({ sources: cast.map((x) => ({ url: x.source.url, label: castLabel(x) })), ...(SLOT !== null && { slot: Number(SLOT) }) }),
     });
   } catch (err) {
     console.error('[stream-sniffer] relay unreachable', err);
@@ -1950,6 +1955,7 @@ form.addEventListener('submit', (e) => {
 // ?url=&referer=&origin= link. With nothing to play, open the menu at the form.
 async function init() {
   const reset = await chrome.runtime.sendMessage({ type: 'player-reset' });
+  if (SLOT !== null && !/^[01]$/.test(SLOT)) throw new Error(`This player link asks for slot ${JSON.stringify(SLOT)}, but a slot is 0 or 1.`);
   if (!reset?.ok) throw new Error(`Could not clear this tab's old header rules: ${reset?.error ?? 'no response from background'}`);
   const sources = [];
   for (const id of params.getAll('cap').slice(0, MAX_STREAMS)) sources.push(await loadSource(id));

@@ -212,7 +212,9 @@ shows one at a time, full screen.
 - **Keep the player tab open.** It does the fetching for the TV. If you close it, the TV stops,
   and the cast controls show a warning.
 - **One cast at a time.** Starting a new relay cast stops the previous one, and the old tab says
-  so. (A cast can hold two streams for [Swap on TV](#swap-on-tv).)
+  so. (A cast can hold two streams for [Swap on TV](#swap-on-tv).) The exception is a player
+  opened as `player.html?slot=0` or `?slot=1`, as couch-director does: casts in different
+  slots run side by side, and a new cast replaces only its own slot's.
 - **Your computer must stay awake** and on the same network as the Chromecast.
 - **Watch the "Relay activity" box** if the TV stalls. It shows how many requests the TV has made
   and any errors from the stream server.

@@ -713,6 +713,7 @@ async function jobResult(req, res, stream, jobId) {
 
 const castInfo = (id, s) => ({
   id,
+  slot: s.slot,
   url: s.url,
   mediaUrl: LAN_BASE + (s.channel ? `/s/${id}/live.m3u8` : relayPath(id, s.url)),
   castPageUrl: `http://localhost:${PORT}/cast/${id}`,
@@ -794,12 +795,21 @@ async function handle(req, res) {
       }
       if (typeof s.label !== 'string' || !s.label) return sendJson(res, 400, { error: `stream ${s.url} needs a label` });
     }
-    // One stream at a time: retire the others so their player tabs stop polling (each held
-    // poll is one of Chrome's 6 connections to localhost:PORT).
-    for (const [oldId, old] of streams) retire(oldId, old, 'superseded');
+    // slot (0 or 1): couch-director casts two games at once, one per slot, from a player tab
+    // each. A cast in a slot replaces only that slot's cast (and any cast without a slot).
+    const slot = body.slot ?? null;
+    if (slot !== null && slot !== 0 && slot !== 1) {
+      return sendJson(res, 400, { error: `slot must be 0 or 1, or left out: ${JSON.stringify(body.slot)}` });
+    }
+    // Without a slot, one stream at a time: retire the others so their player tabs stop polling
+    // (each held poll is one of Chrome's 6 connections to localhost:PORT).
+    for (const [oldId, old] of streams) {
+      if (slot === null || old.slot === null || old.slot === slot) retire(oldId, old, 'superseded');
+    }
     const id = crypto.randomBytes(6).toString('hex');
     streams.set(id, {
       superseded: false,
+      slot,
       url: sources[0].url,
       sources: sources.map((s) => ({ url: s.url, label: s.label, mediaUrl: null })),
       channel: newChannel(), // one stream too: it gets the reserve, unless it turns out not to fit (see probe)
@@ -814,12 +824,12 @@ async function handle(req, res) {
       bridgeSeenAt: null,
     });
     const what = sources.length > 1 ? `a Swap on TV channel: ${sources.map((s) => `"${s.label}"`).join(' and ')}` : sources[0].url;
-    console.log(`[relay] ${id}: registered ${what}; waiting for the player tab to probe it`);
+    console.log(`[relay] ${id}: registered ${what}${slot === null ? '' : ` in slot ${slot}`}; waiting for the player tab to probe it`);
     return sendJson(res, 200, { id });
   }
 
   if (req.method === 'GET' && url.pathname === '/api/streams') {
-    return sendJson(res, 200, [...streams].map(([id, s]) => ({ id, url: s.url, superseded: s.superseded, requests: s.stats.requests })));
+    return sendJson(res, 200, [...streams].map(([id, s]) => ({ id, url: s.url, slot: s.slot, superseded: s.superseded, requests: s.stats.requests })));
   }
 
   // /api/streams/<id>[/<action>[/<jobId>]]
