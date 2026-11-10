@@ -387,13 +387,18 @@ index.m3u8?token=${TOKEN}
   ).then(() => ({
     rejected,
     served,
-    // Stops /live/stall/ from adding segments for ms milliseconds.
     // Makes the next /live/stall/ playlist request hang with no answer.
     hangNextPlaylist: () => {
       stall.hang++;
     },
-    stallLive: (ms) => {
+    // Stops /live/stall/ from adding segments for ms milliseconds.
+    // With catchUp false the source stays that far behind afterwards, as a real one does: its
+    // next segment is the one after the last it offered, not the one it would have reached.
+    stallLive: (ms, { catchUp = true } = {}) => {
       stall.until = Date.now() + ms;
+      if (catchUp) return;
+      if (liveStart.stall === undefined) throw new Error('stallLive: /live/stall/ has not been requested yet');
+      liveStart.stall += ms;
     },
     // closeAllConnections: keep-alive sockets (from fetch and the relay) would otherwise hold
     // close() open forever.

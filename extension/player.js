@@ -110,20 +110,33 @@ function streamLabel(s) {
   return `${place} ${where}`;
 }
 
+// Seconds of video buffered past what's on screen (in the stretch the picture is in).
+function bufferedAhead(v) {
+  const range = bufferedRange(v);
+  return range ? range[1] - v.currentTime : 0;
+}
+function bufferedRange(v) {
+  for (let i = 0; i < v.buffered.length; i++) {
+    if (v.buffered.start(i) <= v.currentTime + 0.1 && v.buffered.end(i) > v.currentTime) return [v.buffered.start(i), v.buffered.end(i)];
+  }
+  return null;
+}
+
 // What a stream is doing: how much video is buffered past what's on screen, and when new video
 // last arrived. A source that stopped adding segments looks different here from a player that
 // stopped using the ones it has.
 function streamState(s) {
   const v = s.video;
   const now = performance.now();
-  let ahead = 0;
-  for (let i = 0; i < v.buffered.length; i++) {
-    if (v.buffered.start(i) <= v.currentTime + 0.1 && v.buffered.end(i) > v.currentTime) ahead = v.buffered.end(i) - v.currentTime;
-  }
   const ago = (t) => (t ? `${((now - t) / 1000).toFixed(1)} s ago` : 'not yet');
+  // What's coming in, so a source that dropped to a low quality looks different from one that
+  // stopped: the picture's real size, and what the recent segments measured.
+  const mbps = s.rates?.length ? measuredMbps(s) : 0;
   return [
-    `${ahead.toFixed(1)} s buffered ahead`,
-    `video at ${v.currentTime.toFixed(1)} s${v.paused ? ' (paused)' : ''}`,
+    `${bufferedAhead(v).toFixed(1)} s buffered ahead`,
+    `video at ${v.currentTime.toFixed(1)} s${v.paused ? ' (paused)' : ''}${v.playbackRate !== 1 ? ` at ${Math.round(v.playbackRate * 100)}% speed` : ''}`,
+    v.videoHeight ? `picture ${v.videoWidth}x${v.videoHeight} (${v.videoHeight}p)` : 'picture size not known yet',
+    mbps ? `${mbps.toFixed(1)} Mbps coming in` : '',
     `newest segment in the playlist appeared ${ago(s.edgeAt)}`,
     `last segment downloaded ${ago(s.fragAt)}`,
     `playlist last loaded ${ago(s.playlistAt)}`,
@@ -203,6 +216,135 @@ setInterval(() => {
   }
 }, 1000);
 
+// The cushion against freezes: seconds of video kept in reserve, so a source that falls behind
+// for a while (StreamEast's often posted segments 13–24 s late, Nov 2026) doesn't freeze the
+// picture. hls.js only starts that far behind live; a late source uses the reserve up, and since
+// such a source doesn't catch up, hls.js never gets it back. So the player wins it back: by
+// playing at CUSHION_RATE until it's full, or, when the picture runs out anyway, by holding it
+// until it's full. Either way that's delay added on purpose, and the menu says when it happens.
+// Off leaves hls.js as it was. It applies to streams played here (and Chrome's own Cast of this
+// tab), not to a copy of a page's video, and not to the TV's player when casting via the relay.
+const CUSHION_RATE = 0.95;
+let cushionS = 0;
+const cushionSel = document.getElementById('cushion');
+const cushionStatus = document.getElementById('cushion-status');
+chrome.storage.local
+  .get('cushionS')
+  .then(({ cushionS: saved }) => {
+    if (saved === undefined) return;
+    if (![...cushionSel.options].some((o) => Number(o.value) === saved)) throw new Error(`the saved choice (${saved}) isn't one of the menu's`);
+    cushionS = saved;
+    cushionSel.value = String(saved);
+    for (const s of streams) applyCushion(s, false);
+  })
+  .catch((err) => failPage(`Couldn't read the cushion against freezes: ${err.message}`));
+cushionSel.addEventListener('change', () => {
+  cushionS = Number(cushionSel.value);
+  logEvent(null, cushionS ? `cushion set to ${cushionS} s` : 'cushion turned off');
+  for (const s of streams) applyCushion(s, true);
+  renderCushion();
+  chrome.storage.local.set({ cushionS }).catch((err) => failPage(`Couldn't save the cushion against freezes: ${err.message}`));
+});
+
+// Puts the current cushion into a stream's hls.js. With reposition (the choice just changed),
+// the picture moves to match: forward for less delay, back into video already played for more
+// (the rest is won back as above).
+function applyCushion(s, reposition) {
+  const { hls, video: v } = s;
+  if (!hls) return;
+  if (cushionS) {
+    hls.targetLatency = cushionS; // where hls.js starts, and where "Jump to live" goes
+    // hls.js stops buffering at 30 s ahead by default; the reserve needs room past that.
+    hls.config.maxBufferLength = Math.max(30, cushionS + 10);
+  } else if (reposition) {
+    hls.targetLatency = undefined; // its default again: 3 segments behind live
+    hls.config.maxBufferLength = 30;
+  }
+  if (!cushionS) {
+    v.playbackRate = 1;
+    if (s.holding) releaseHold(s, 'the cushion was turned off');
+  }
+  if (!reposition) return;
+  const range = bufferedRange(v);
+  if (!range) return;
+  const goal = cushionS || 3 * (hls.latestLevelDetails?.targetduration || 2);
+  const ahead = range[1] - v.currentTime;
+  if (ahead > goal + 1) v.currentTime = range[1] - goal;
+  else if (cushionS && ahead < goal - 1) v.currentTime = Math.max(range[0] + 0.5, range[1] - goal);
+  else return;
+  const moved = range[1] - v.currentTime - ahead; // more reserve = further back
+  logEvent(s, `picture moved ${Math.abs(moved).toFixed(1)} s ${moved > 0 ? 'back' : 'forward'} for the new cushion`);
+}
+
+function releaseHold(s, why) {
+  s.holding = null;
+  logEvent(s, `picture released: ${why}`);
+  s.video.play().catch((err) => fail(s, `video.play() failed after holding the picture: ${err.message}`));
+  render();
+}
+
+setInterval(() => {
+  for (const s of streams) {
+    const v = s.video;
+    if (!s.hls || s.stopped || !cushionS) {
+      if (s.holding) s.holding = null; // stopped or replaced: nothing left to hold
+      continue;
+    }
+    const ahead = bufferedAhead(v);
+    if (s.holding) {
+      if (!v.paused) {
+        // Play pressed (or media keys) while held: the user's call.
+        s.holding = null;
+        logEvent(s, `picture released early, by play, with ${ahead.toFixed(1)} s of ${cushionS} s in reserve`);
+        render();
+      } else if (ahead >= cushionS - 0.5) releaseHold(s, `${ahead.toFixed(1)} s in reserve again`);
+      // A reserve that can't fill (the browser's media memory is full, say) mustn't hold the
+      // picture forever.
+      else if (performance.now() - s.holding.since > (cushionS + 30) * 1000) {
+        releaseHold(s, `the reserve didn't fill (${ahead.toFixed(1)} s of ${cushionS} s after ${cushionS + 30} s); playing on with what there is`);
+      } else render(); // the line over the video counts up
+      continue;
+    }
+    // Out of video: the picture has frozen anyway, so it waits a little longer for a full reserve.
+    if (s.bufferingSince && !v.paused) {
+      s.holding = { since: performance.now() };
+      v.playbackRate = 1;
+      logEvent(s, `out of video: holding the picture until ${cushionS} s are in reserve`);
+      v.pause();
+      render();
+      continue;
+    }
+    // s.reserve is measured as each segment arrives, when the reserve is at its fullest; between
+    // segments it runs down by the segment's length, which is no reason to slow down.
+    if (s.reserve == null) continue;
+    if (v.playbackRate === 1 && s.reserve < cushionS - 1) {
+      v.playbackRate = CUSHION_RATE;
+      logEvent(s, `reserve down to ${s.reserve.toFixed(1)} s of ${cushionS} s: playing at ${CUSHION_RATE * 100}% speed to refill it`);
+    } else if (v.playbackRate !== 1 && s.reserve >= cushionS - 0.25) {
+      v.playbackRate = 1;
+      logEvent(s, `reserve back to ${s.reserve.toFixed(1)} s: normal speed`);
+    }
+  }
+  renderCushion();
+}, 500);
+
+function renderCushion() {
+  if (!cushionS) {
+    cushionStatus.textContent = '';
+    return;
+  }
+  const lines = streams.map((s, i) => {
+    const which = streams.length > 1 ? `${i ? 'Small' : 'Big'}: ` : '';
+    if (s.source.viaVideo) return `${which}doesn't apply to a copy of a page's video`;
+    if (!s.hls) return '';
+    const reserve = s.holding ? bufferedAhead(s.video) : s.reserve;
+    const now = reserve == null ? 'filling the reserve' : `${reserve.toFixed(0)} s of ${cushionS} s in reserve`;
+    const doing = s.holding ? ' (holding the picture to refill it)' : s.video.playbackRate !== 1 ? ` (refilling: playing at ${Math.round(s.video.playbackRate * 100)}% speed)` : '';
+    return `${which}${now}${doing}`;
+  });
+  cushionStatus.textContent = [...lines.filter(Boolean), `Adds about ${cushionS} s of delay.`].join(' · ');
+}
+
 // A stream that stops (the server didn't answer, timed out or had an error; the video couldn't
 // be decoded) is tried again by itself after these waits; one that plays again starts the count
 // over. A refused link (4xx) isn't: it has most likely expired, and only its page has a fresh one.
@@ -275,6 +417,10 @@ async function startStream(source, slot, { retries = 0, lastReason = '', manual 
     lastTime: -1, // the video's time at the last freeze check, and whether a freeze is logged
     stuckSince: null,
     frozenLogged: false,
+    // The cushion against freezes (see CUSHION_RATE): seconds buffered ahead as the newest
+    // segment arrived (null until one has), and { since } while the picture is held to refill it.
+    reserve: null,
+    holding: null,
   };
   streams[slot] = stream;
   logEvent(stream, `${manual ? 'Retry pressed' : retries ? `automatic retry ${retries}` : 'started'}${slot ? ' (small picture)' : ''}`);
@@ -431,6 +577,10 @@ async function startStream(source, slot, { retries = 0, lastReason = '', manual 
     stream.codecContainer = video.container;
     checkHardware(stream);
   });
+  hls.on(Hls.Events.FRAG_BUFFERED, (_e, { frag }) => {
+    if (frag.type === 'main') stream.reserve = bufferedAhead(video);
+  });
+  applyCushion(stream, false);
   hls.loadSource(source.url);
   hls.attachMedia(video);
 }
@@ -577,7 +727,8 @@ function swap() {
   oldSmall.video.muted = !sound;
   oldBig.autoMuted = oldSmall.autoMuted = false;
   for (const s of streams) {
-    if (active(s) && s.video.paused) s.video.play().catch((err) => fail(s, `video.play() failed: ${err.message}`));
+    // A picture held by the cushion against freezes stays held.
+    if (active(s) && s.video.paused && !s.holding) s.video.play().catch((err) => fail(s, `video.play() failed: ${err.message}`));
   }
   persist();
   fillForm();
@@ -743,6 +894,7 @@ for (const v of videos) {
   v.addEventListener('pause', () => {
     const s = streamOf(v);
     if (!active(s) || v.ended) return; // stopped or replaced on purpose, or the end of a video
+    if (s.holding) return; // held by the cushion against freezes, on purpose
     const now = performance.now();
     const at = new Date().toLocaleTimeString();
     if (now - s.resumedAt < 1000) {
@@ -787,7 +939,7 @@ navigator.mediaSession.setActionHandler('pause', () => {
 });
 navigator.mediaSession.setActionHandler('play', () => {
   for (const s of streams) {
-    if (active(s)) s.video.play().catch((err) => fail(s, `video.play() failed: ${err.message}`));
+    if (active(s) && !s.holding) s.video.play().catch((err) => fail(s, `video.play() failed: ${err.message}`));
   }
 });
 
@@ -1031,6 +1183,7 @@ function health(s) {
   if (s.error) return ''; // a failed stream isn't buffering or retrying; its error line says why
   if (s.retrying && !s.stopped) return s.retryNote;
   if (s.lastProblemShort) return s.lastProblemShort;
+  if (s.holding) return `Refilling the cushion: ${bufferedAhead(s.video).toFixed(0)} of ${cushionS} s…`;
   return s.bufferingSince ? 'Buffering…' : '';
 }
 
@@ -1628,16 +1781,27 @@ async function runJob(b, job) {
   try {
     const stream = b.cast[job.src ?? 0];
     if (!stream) throw new Error(`the relay asked for stream ${job.src + 1}, but this tab is casting ${b.cast.length}`);
-    await allowHost(stream, job.url);
-    // A request the stream server never answers would otherwise stay open forever. The relay
-    // has asked again long before this (and gives up at 20 s), so this only frees the connection.
-    const up = await fetch(job.url, { cache: 'no-store', signal: AbortSignal.timeout(25000) });
-    body = await up.arrayBuffer();
-    headers = {
-      'x-upstream-status': String(up.status),
-      'x-upstream-type': encodeURIComponent(up.headers.get('content-type') || ''),
-      'x-upstream-url': encodeURIComponent(up.url),
-    };
+    if (stream.source.viaPage && !StreamSnifferShared.isWeb(job.url)) {
+      // A playlist the game page's own player makes (see page-hook.js): only that page has it.
+      // Its errors (the page was closed or reloaded) say so, and reach the cast controls.
+      body = await StreamSnifferShared.fetchFromPage(stream.source.viaPage, job.url);
+      headers = {
+        'x-upstream-status': '200',
+        'x-upstream-type': encodeURIComponent('application/vnd.apple.mpegurl'),
+        'x-upstream-url': encodeURIComponent(job.url),
+      };
+    } else {
+      await allowHost(stream, job.url);
+      // A request the stream server never answers would otherwise stay open forever. The relay
+      // has asked again long before this (and gives up at 20 s), so this only frees the connection.
+      const up = await fetch(job.url, { cache: 'no-store', signal: AbortSignal.timeout(25000) });
+      body = await up.arrayBuffer();
+      headers = {
+        'x-upstream-status': String(up.status),
+        'x-upstream-type': encodeURIComponent(up.headers.get('content-type') || ''),
+        'x-upstream-url': encodeURIComponent(up.url),
+      };
+    }
   } catch (err) {
     // Reported to the relay, which shows it on the cast page and fails the TV's request.
     body = '';
@@ -1664,12 +1828,11 @@ relayBtn.addEventListener('click', async () => {
   await relayReady;
   // Two streams in the player: cast both as one channel, big one first, so the TV can swap.
   const cast = streams.slice(0, 2);
-  // The relay fetches every address itself through this tab's plain fetch; a playlist only the
-  // game page can make (see page-hook.js) isn't wired through yet.
-  const pageMade = cast.find((s) => s.source.viaPage || s.source.viaVideo);
-  if (pageMade) {
-    const what = pageMade.source.viaVideo ? "is a copy of its page's video" : "has a playlist made by its page's own player";
-    setRelay(`can't cast ${cast.length > 1 ? 'these streams' : 'this stream'} yet: ${streamLabel(pageMade)} ${what}, and casting via the relay doesn't support that. Use Chrome's own Cast (Fit to TV) instead.`);
+  // The relay asks this tab for addresses (playlists and segments); a copy of a page's video
+  // (see mirror.js) has none to ask for.
+  const copy = cast.find((s) => s.source.viaVideo);
+  if (copy) {
+    setRelay(`can't cast ${cast.length > 1 ? 'these streams' : 'this stream'}: ${streamLabel(copy)} is a copy of its page's video, which has no playlist for the relay to hand the TV. Use Chrome's own Cast (Fit to TV) instead.`);
     return;
   }
   setRelay(

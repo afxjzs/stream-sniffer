@@ -29,18 +29,28 @@ them to play the stream anywhere else.
   address scheme (`vttp://…`), so no `.m3u8` ever crosses the network. A small script in each
   page (`page-hook.js`) notices those playlists and lists them in the popup. The player then
   asks that page for each playlist refresh, so **the game page has to stay open** while it plays;
-  if it closes, the player says so. VLC, curl and casting via the relay can't use these
-  streams yet, and say so. Chrome's own Cast works.
+  if it closes, the player says so. Casting via the relay works the same way: the player tab
+  gets each playlist from the page for the TV. VLC and curl can't use these streams, and say so.
 - **A copy of the video, when nothing else works.** Whatever a page's player does to hide its
   stream, it still hands its video to the browser. The page script keeps the latest of that,
   and the popup lists it as "Video playing in <site>". The player then plays a live copy
   (`mirror.js`). The page has to stay open and playing. Its sound is turned down while it's
   copied. The quality is whatever the page's player chose. Casting via the relay can't use it
-  yet; Chrome's own Cast can.
+  (there's no playlist to hand the TV); Chrome's own Cast can.
 - **Freeze log.** The player records every frozen picture, stall, error and retry, with how much
   video was buffered and when the source last offered a new segment. It's kept across reloads
   (the last 500 entries). ⚙ → **Copy log** copies it for a bug report. Stream links appear
-  without their query string, which can hold a token.
+  without their query string, which can hold a token. Each entry also has the picture's
+  resolution and the bitrate coming in, so a source that dropped to a low quality looks
+  different from one that stopped.
+- **Cushion against freezes.** ⚙ → **Cushion against freezes** (Off, or 5 to 60 s) keeps that
+  much video in reserve, so a source that falls behind for a while doesn't freeze the picture.
+  It adds about that much delay. A late source uses up the reserve, and since such a source
+  doesn't catch up, the player wins it back: it plays at 95% speed until the reserve is full,
+  or, if the picture runs out anyway, holds it until the reserve is full. The menu shows the
+  reserve and when either is happening; the freeze log records both. It applies to playing in
+  the player tab (and Chrome's own Cast of it), not to the TV's player when casting via the
+  relay, and not to a copy of a page's video.
 
 ## Requirements
 

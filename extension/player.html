@@ -40,6 +40,23 @@
   <div id="menu" hidden>
     <div id="streams"></div>
     <label class="toggle"><input id="frame-warnings" type="checkbox" checked> Warn about lost frames and refresh-rate hitches</label>
+    <!-- Seconds of video kept in reserve, so a late source doesn't freeze the picture (see the
+         cushion in player.js). The same choice for both pictures, remembered. -->
+    <div class="toggle">
+      <label for="cushion">Cushion against freezes</label>
+      <select id="cushion" title="Keeps this much video in reserve, so a source that falls behind doesn't freeze the picture. Adds about that much delay.">
+        <option value="0">Off</option>
+        <option value="5">5 s</option>
+        <option value="10">10 s</option>
+        <option value="15">15 s</option>
+        <option value="20">20 s</option>
+        <option value="25">25 s</option>
+        <option value="30">30 s</option>
+        <option value="45">45 s</option>
+        <option value="60">60 s</option>
+      </select>
+    </div>
+    <p id="cushion-status" class="muted small"></p>
     <!-- Casting stays in view: it's what the menu is opened for most. -->
     <div id="cast">
       <p class="muted small">Cast via relay (beta)</p>

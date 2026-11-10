@@ -1309,12 +1309,102 @@ async function main() {
       // What tells a stalled source from a stuck player: no new segment from the source for a while.
       const newest = Number(froze.match(/newest segment in the playlist appeared ([\d.]+) s ago/)?.[1]);
       assert(newest >= 3, `it shows the source had offered nothing new for a while (${newest} s)`);
+      // A source that dropped to a low quality looks different from one that stopped.
+      assert(/\b\d{3,4}p\b/.test(froze) && /[\d.]+ Mbps/.test(froze), 'it shows the resolution and bitrate coming in');
       assert(lines.slice(at + 1).some((l) => /again/i.test(l)), 'and, after it, that the picture played again');
       await fz.reload();
       const after = await copyLog();
       assert(after.includes(froze), 'after a reload, the freeze is still in the log');
       ok('the log survives a reload');
       await fz.close();
+    }
+
+    step('With a cushion picked, a source that falls behind freezes the picture once at most, then the player keeps a reserve: the next hiccup passes unseen');
+    {
+      const cu = await browser.newPage();
+      await cu.goto(`chrome-extension://${ext.id}/player.html`);
+      const CUSHION = '::-p-aria(Cushion against freezes)';
+      await cu.select(CUSHION, '10');
+      await cu.type('input[name=url]', MASTER_URL.replace('/live/', '/live/stall/'));
+      await cu.type('input[name=referer]', EMBED + '/');
+      await cu.click('button::-p-text(Play)');
+      await waitForPlayback(cu, 'stall stream with a 10 s cushion', 1);
+      // Seconds of video buffered past what's on screen: the reserve that rides out a late source.
+      const ahead = () =>
+        cu.evaluate(() => {
+          const v = document.querySelector('video.big');
+          for (let i = 0; i < v.buffered.length; i++) {
+            if (v.buffered.start(i) <= v.currentTime + 0.1 && v.buffered.end(i) > v.currentTime) return v.buffered.end(i) - v.currentTime;
+          }
+          return 0;
+        });
+      // Waits until the reserve is (nearly) full and the picture plays; returns what it saw.
+      const reserveFull = async (timeoutMs) => {
+        const until = Date.now() + timeoutMs;
+        let a = 0;
+        while (Date.now() < until) {
+          a = await ahead();
+          const paused = await cu.evaluate(() => document.querySelector('video.big').paused);
+          if (a >= 9 && !paused) return a;
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        return a;
+      };
+      // The longest the picture stood still during ms (sampled every 250 ms), in seconds.
+      const longestStill = (ms) =>
+        cu.evaluate(
+          (ms) =>
+            new Promise((resolve) => {
+              const v = document.querySelector('video.big');
+              let last = v.currentTime;
+              let since = performance.now();
+              let longest = 0;
+              const end = performance.now() + ms;
+              const timer = setInterval(() => {
+                const now = performance.now();
+                if (v.currentTime !== last) {
+                  last = v.currentTime;
+                  since = now;
+                }
+                longest = Math.max(longest, now - since);
+                if (now >= end) {
+                  clearInterval(timer);
+                  resolve(longest / 1000);
+                }
+              }, 250);
+            }),
+          ms
+        );
+      // The source stops for longer than the cushion and stays behind afterwards, as StreamEast
+      // did all through a game (Nov 2026): the picture freezes, and the reserve has to be won back.
+      servers.stallLive(14000, { catchUp: false });
+      await new Promise((r) => setTimeout(r, 14000));
+      const refilled = await reserveFull(40000);
+      assert(refilled >= 9, `after the freeze, the player builds the reserve back up (${refilled.toFixed(1)} s of 10 s buffered ahead)`);
+      // A shorter hiccup now, again with the source staying behind.
+      servers.stallLive(7000, { catchUp: false });
+      const still = await longestStill(11000);
+      assert(still < 1.5, `a 7 s hiccup at the source doesn't freeze the picture (longest still: ${still.toFixed(1)} s)`);
+      // The hiccup used up 7 s of the reserve; the player wins it back by playing a little slower.
+      const rate = await cu.evaluate(
+        () =>
+          new Promise((resolve) => {
+            const v = document.querySelector('video.big');
+            const [t0, w0] = [v.currentTime, performance.now()];
+            setTimeout(() => resolve((v.currentTime - t0) / ((performance.now() - w0) / 1000)), 6000);
+          })
+      );
+      assert(rate > 0.9 && rate < 0.98, `then it plays slightly slower to refill the reserve (${(rate * 100).toFixed(0)}% speed)`);
+      if (await cu.$eval('#menu', (m) => m.hidden)) await cu.click('::-p-aria(Settings)');
+      const said = await waitForText(cu, /reserve/i, 5000).catch(() => '');
+      assert(/refill|slower|9\d ?%/i.test(said), `and says so in the menu ("${said}")`);
+      // Less delay on request: Off goes back to playing close to live, at normal speed.
+      await cu.select(CUSHION, '0');
+      await new Promise((r) => setTimeout(r, 3000));
+      const [offAhead, offRate] = [await ahead(), await cu.evaluate(() => document.querySelector('video.big').playbackRate)];
+      assert(offRate === 1, `with the cushion off, it plays at normal speed (${offRate})`);
+      assert(offAhead <= 7, `and close to live again (${offAhead.toFixed(1)} s buffered ahead)`);
+      await cu.close();
     }
 
     step('A player that makes its playlists inside the page (Shaka with its own vttp:// scheme) is captured, and plays while that page stays open');
@@ -1356,6 +1446,58 @@ async function main() {
       await game.close();
       const gone = await waitForText(pl, /page .*(closed|gone)/i, 30000);
       ok(`closing the game page is reported, not a silent freeze: "${gone.slice(0, 160)}"`);
+      await pl.close();
+      if (!pop.isClosed()) await pop.close();
+    }
+
+    step('A stream whose playlists come from its page casts via the relay, while that page stays open');
+    {
+      const game = await browser.newPage();
+      await game.goto(SITE + '/page-made');
+      const frame = await game.waitForFrame((f) => f.url().startsWith(EMBED) && f.url().includes('shaka=1'));
+      await waitForPlayback(frame, "the page-made embed's own Shaka player");
+      await game.bringToFront();
+      const known = new Set(browser.targets());
+      const popupP = browser.waitForTarget((t) => !known.has(t) && t.url().includes('/popup.html'), { timeout: 5000 });
+      await ext.triggerAction(game);
+      const pop = await (await popupP).asPage();
+      await pop.waitForSelector('::-p-text(games.example)', { timeout: 10000 });
+      let item = null;
+      for (const li of await pop.$$('li')) if ((await li.evaluate((el) => el.textContent)).includes('master.m3u8')) item = li;
+      assert(item, 'popup has an entry for the master playlist');
+      const playerP = browser.waitForTarget((t) => !known.has(t) && t.url().includes('/player.html'), { timeout: 5000 });
+      await (await item.$('button::-p-text(Open in player)')).click();
+      const pl = await (await playerP).asPage();
+      await waitForPlayback(pl, 'page-made stream in the extension player', 1, 20000);
+      await startCasting(pl);
+      const castFrame = await pl.waitForFrame((f) => f.url().startsWith(`${RELAY}/cast/`), { timeout: 10000 });
+      const media = (await waitForText(castFrame, /http:\/\/[\d.]+:8789\/\S+/)).match(/http:\/\/[\d.]+:8789\/\S+/)[0];
+      ok(`the relay takes it: ${media}`);
+      // Acting as the Chromecast.
+      const pmaster = await fetch(media);
+      assert(pmaster.status === 200, `the cast's playlist -> 200 (got ${pmaster.status})`);
+      // The relay hands the TV either a list of qualities or (relisted) the video's own playlist.
+      const ptop = await pmaster.text();
+      const pvariantUrl = /#EXT-X-STREAM-INF/.test(ptop) ? new URL(firstUri(ptop), media).href : media;
+      const variantNow = async () => {
+        const r = await fetch(pvariantUrl);
+        return { status: r.status, text: await r.text() };
+      };
+      const v1 = await variantNow();
+      assert(v1.status === 200 && /#EXTINF/.test(v1.text), `video playlist -> 200, listing segments (got ${v1.status}: ${v1.text.slice(0, 200)})`);
+      const pseg = await fetch(new URL(firstUri(v1.text), pvariantUrl));
+      const psegBytes = new Uint8Array(await pseg.arrayBuffer());
+      assert(pseg.status === 200 && psegBytes[0] === 0x47, `segment -> 200 with MPEG-TS data (${pseg.status}, ${psegBytes.length} bytes)`);
+      // Past the 3-segment window (6 s): what the TV gets next needs fresh playlists from the page.
+      await new Promise((r) => setTimeout(r, 10000));
+      const v2 = await variantNow();
+      const seq = (t) => Number(t.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/)?.[1]);
+      assert(v2.status === 200 && seq(v2.text) > seq(v1.text), `10 s later the TV's playlist has moved on (sequence ${seq(v1.text)} -> ${seq(v2.text)})`);
+      const pseg2 = await fetch(new URL(firstUri(v2.text), pvariantUrl));
+      assert(pseg2.status === 200 && new Uint8Array(await pseg2.arrayBuffer())[0] === 0x47, `and its segments are real video (${pseg2.status})`);
+      await game.close();
+      const gone = await waitForText(castFrame, /page .*(closed|gone)/i, 30000);
+      ok(`closing the game page is reported on the cast controls: "${gone.slice(0, 200)}"`);
       await pl.close();
       if (!pop.isClosed()) await pop.close();
     }

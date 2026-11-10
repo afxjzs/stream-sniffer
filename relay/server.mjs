@@ -724,6 +724,22 @@ const castInfo = (id, s) => ({
 // A short, fixed address for whatever is casting now, so a TV app (VLC, a Fire TV player) can
 // keep one URL instead of typing a new long one for every cast.
 const NOW_PATH = '/now.m3u8';
+
+// Ends a cast: its player tab stops being asked for anything, and /now.m3u8 stops serving it.
+// why: "superseded" (a newer cast took over) or "stopped" (asked to, e.g. its stream died).
+function retire(id, s, why) {
+  if (s.superseded) return;
+  s.superseded = true;
+  clearInterval(s.refreshTimer);
+  for (const w of s.waiters.splice(0)) w(null);
+  // Its unfinished fetches (e.g. video held back for its TV) would otherwise wait out
+  // BRIDGE_TIMEOUT_MS for a tab that has moved on, then report it as a failure.
+  const dropped = s.inflight.size;
+  for (const drop of [...s.inflight]) drop();
+  s.queue.length = 0;
+  console.log(`[relay] ${id}: ${why}${dropped ? `; dropped ${dropped} fetch${dropped === 1 ? '' : 'es'} it still had waiting` : ''}`);
+}
+
 function currentCast() {
   const live = [...streams].filter(([, s]) => !s.superseded);
   return live.length ? live.at(-1) : null;
@@ -765,23 +781,22 @@ async function handle(req, res) {
       return sendJson(res, 400, { error: 'sources must list one or two streams' });
     }
     for (const s of sources) {
-      if (!/^https?:\/\//.test(s?.url || '')) return sendJson(res, 400, { error: `stream url must be http(s): ${JSON.stringify(s?.url)}` });
+      // http(s), or a page's own scheme (vttp://…) for a playlist the game page makes, which the
+      // player tab asks that page for (see page-hook.js). Either way the player tab fetches it.
+      let host = '';
+      try {
+        host = new URL(s?.url).host;
+      } catch {
+        // host stays empty: refused just below
+      }
+      if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s?.url || '') || !host) {
+        return sendJson(res, 400, { error: `stream url must be an address with a host (http(s), or a page's own scheme): ${JSON.stringify(s?.url)}` });
+      }
       if (typeof s.label !== 'string' || !s.label) return sendJson(res, 400, { error: `stream ${s.url} needs a label` });
     }
     // One stream at a time: retire the others so their player tabs stop polling (each held
     // poll is one of Chrome's 6 connections to localhost:PORT).
-    for (const [oldId, old] of streams) {
-      if (old.superseded) continue;
-      old.superseded = true;
-      clearInterval(old.refreshTimer);
-      for (const w of old.waiters.splice(0)) w(null);
-      // Its unfinished fetches (e.g. video held back for its TV) would otherwise wait out
-      // BRIDGE_TIMEOUT_MS for a tab that has moved on, then report it as a failure.
-      const dropped = old.inflight.size;
-      for (const drop of [...old.inflight]) drop();
-      old.queue.length = 0;
-      console.log(`[relay] ${oldId}: superseded${dropped ? `; dropped ${dropped} fetch${dropped === 1 ? '' : 'es'} it still had waiting` : ''}`);
-    }
+    for (const [oldId, old] of streams) retire(oldId, old, 'superseded');
     const id = crypto.randomBytes(6).toString('hex');
     streams.set(id, {
       superseded: false,
@@ -839,6 +854,11 @@ async function handle(req, res) {
       return sendJson(res, 200, castInfo(id, s));
     }
     if (req.method === 'POST' && action === 'switch') return switchChannel(id, s, res);
+    // Ends the cast (e.g. its stream is gone for good): /now.m3u8 then says nothing is casting.
+    if (req.method === 'POST' && action === 'stop') {
+      retire(id, s, 'stopped');
+      return sendJson(res, 200, { ok: true });
+    }
     return sendJson(res, 404, { error: 'not found' });
   }
 
@@ -866,7 +886,10 @@ async function handle(req, res) {
     let upstream;
     try {
       upstream = unb64(parts[3]);
-      if (!/^https?:\/\//.test(upstream)) throw new Error('not http(s)');
+      // http(s), or the page-made scheme of this cast's own stream (see /api/streams).
+      const scheme = new URL(upstream).protocol;
+      const own = new URL(stream.sources[src].url).protocol;
+      if (!/^https?:$/.test(scheme) && scheme !== own) throw new Error(`scheme ${scheme} isn't this stream's`);
     } catch {
       return send(res, 400, 'bad upstream reference');
     }
